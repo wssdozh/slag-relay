@@ -25,6 +25,7 @@ class HttpRouter:
         """Порядок — часть контракта: prefix-блоки одного домена не видят запросы другого."""
         return (
             self._route_health,
+            self._route_public,
             self._route_admin,
             self._route_admin_ops,
             self._route_auth,

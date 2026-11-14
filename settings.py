@@ -110,9 +110,9 @@ RATE_LIMIT_AUTH_CHALLENGE = 60
 RATE_LIMIT_PAIR_CREATE = 30
 RATE_LIMIT_TELEMETRY = 120
 PLANS = {
-    "free": {"label": "Free", "devices": 2, "cache_mb": 1024},
-    "smile": {"label": "Smile", "devices": 5, "cache_mb": 10 * 1024},
-    "angry": {"label": "Angry", "devices": 15, "cache_mb": 50 * 1024},
+    "free": {"label": "Free", "devices": 2, "cache_mb": 1024, "price_rub": 0},
+    "smile": {"label": "Smile", "devices": 5, "cache_mb": 10 * 1024, "price_rub": 190},
+    "angry": {"label": "Angry", "devices": 15, "cache_mb": 50 * 1024, "price_rub": 490},
 }
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")

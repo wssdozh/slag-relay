@@ -980,5 +980,21 @@ class TestAccountRelay(RelayTestCase):
         self.assertEqual(s_res["bundles"][0]["syncId"], 3)
 
 
+class TestPublicPlans(RelayTestCase):
+    """The landing reads prices from the relay: one place to change a plan, no drift."""
+
+    async def test_plans_are_public_and_priced_from_settings(self):
+        status, body = await self.http("GET", "/api/plans")
+        self.assertEqual(status, 200)
+        plans = {plan["id"]: plan for plan in body["plans"]}
+        self.assertEqual(set(plans), {"free", "smile", "angry"})
+        self.assertEqual(plans["free"]["priceRub"], 0)
+        self.assertEqual(plans["smile"]["priceRub"], 190)
+        self.assertEqual(plans["angry"]["priceRub"], 490)
+        self.assertEqual(plans["smile"]["devices"], 5)
+        self.assertEqual(plans["smile"]["cacheMb"], 10 * 1024)
+        self.assertEqual(plans["free"]["label"], "Free")
+
+
 if __name__ == "__main__":
     unittest.main()

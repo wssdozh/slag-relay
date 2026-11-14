@@ -243,11 +243,8 @@ class AdminOpsRoutes:
             paywall_views = funnel_counts.get("paywall_view", 0)
             checkout_starts = funnel_counts.get("checkout_start", 0)
             paid_count = sum(t["count"] for t in revenue_map.values())
-            if landing_views == 0 and paid_count > 0:
-                landing_views = paid_count * 20 + 25
-                cta_clicks = paid_count * 7 + 10
-                paywall_views = paid_count * 4 + 6
-                checkout_starts = paid_count * 2 + 2
+            # No made-up funnel: zero events mean zero visits, and the admin shows zeros. A
+            # plausible-looking funnel stitched from the revenue number is worse than none.
 
             steps = [
                 {"name": "визиты", "count": landing_views, "rate": 100.0},

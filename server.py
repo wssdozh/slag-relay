@@ -67,6 +67,7 @@ from router import HttpRouter
 from http_plumbing import HttpPlumbing
 from realtime import Realtime
 from routes_health import HealthRoutes
+from routes_public import PublicRoutes
 from routes_admin import AdminRoutes
 from routes_admin_ops import AdminOpsRoutes
 from routes_auth import AuthRoutes
@@ -78,7 +79,7 @@ from routes_static import StaticRoutes
 
 class SlagRelayServer(
     HttpPlumbing, HttpRouter,          # чтение запроса, ответы, диспетчер по доменам
-    HealthRoutes, AdminRoutes, AdminOpsRoutes, AuthRoutes,   # http-домены
+    HealthRoutes, PublicRoutes, AdminRoutes, AdminOpsRoutes, AuthRoutes,   # http-домены
     NotifyRoutes, VaultRoutes, AiRoutes, StaticRoutes,
     Realtime,                          # websocket: кадры, бандлы, рассылка
     BotDomain, AssistantDomain, AssistantActions, DeliveryDomain, AiProxy,  # telegram и модели

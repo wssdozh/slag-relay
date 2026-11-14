@@ -116,7 +116,8 @@ class AdminRoutes:
             active_accounts = [a for a in accounts if a["status"] == "active"]
             paid_count = sum(1 for a in active_accounts if a["plan"] in ("smile", "angry"))
             free_count = sum(1 for a in active_accounts if a["plan"] == "free")
-            mrr = sum(190 if a["plan"] == "smile" else 490 if a["plan"] == "angry" else 0 for a in active_accounts)
+            # The price lives in PLANS; the landing reads it from there too, so MRR cannot drift.
+            mrr = sum(PLANS.get(a["plan"], {}).get("price_rub", 0) for a in active_accounts)
             rev_row = self.db.conn.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM billing_transactions WHERE status = 'paid'").fetchone()
             total_revenue = rev_row["total"] if rev_row and rev_row["total"] > 0 else mrr
             conv_rate = round((paid_count / len(active_accounts)) * 100, 1) if active_accounts else 0.0
@@ -152,7 +153,7 @@ class AdminRoutes:
             account_id = body.get("accountId", "").strip()
             plan = body.get("plan", "smile").strip().lower()
             period_days = int(body.get("periodDays", 30))
-            amount = float(body.get("amount", 190.0 if plan == "smile" else 490.0))
+            amount = float(body.get("amount", PLANS.get(plan, {}).get("price_rub", 0)))
             if plan not in PLANS or period_days <= 0:
                 raise ApiError(400, "invalid_grant_parameters")
             account = self.db.conn.execute("SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
