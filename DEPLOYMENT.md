@@ -4,7 +4,7 @@
 
 - ssh target: `netcup-server` (`152.53.199.71`).
 - service: `slag-relay.service`; unit: `/etc/systemd/system/slag-relay.service`.
-- code: `/opt/slag-relay/` — `server.py` plus the modules it imports (`relay/*.py` and `relay/store/`); dependencies: `/opt/slag-relay/requirements.txt`.
+- code: `/opt/slag-relay/` — `server.py` plus the modules it imports (`*.py` and `store/`); dependencies: `/opt/slag-relay/requirements.txt`.
 - runtime: `/opt/slag-relay/.venv/bin/python` (python 3.13.5, cryptography 50.0.2).
 - database: `/opt/slag-relay/data/relay.db`.
 - listener: `0.0.0.0:8320`; health: `http://152.53.199.71:8320/health`.
@@ -110,7 +110,7 @@ deployed `/opt/slag-relay/server.py` (previous copy: `/opt/slag-relay/backups/se
 `systemctl restart slag-relay`, health 200, `NRestarts=0`. production smoke on a disposable account:
 fresh session `expiresAt` = +72 h; a session forced down to 60 s slid back to +72 h on one
 authenticated call and the value was visible from another sqlite connection; an expired session
-still answered 401. account and device rows were removed in the same stop window. `relay/test_relay.py`
+still answered 401. account and device rows were removed in the same stop window. `test_relay.py`
 covers the same three cases (`test_session_slides_on_use`).
 
 note: writes to the live database from outside need the service stopped — the relay keeps one shared
@@ -157,7 +157,7 @@ these two endpoints. that is the deliberate trade-off of moving media off the cl
 acceptance probe (creates a disposable account, sets `plan=smile`, blocks it at the end):
 
 ```sh
-SLAG_ADMIN_TOKEN=<admin token> python relay/ai_smoke.py --server http://152.53.199.71:8320
+SLAG_ADMIN_TOKEN=<admin token> python ai_smoke.py --server http://152.53.199.71:8320
 ```
 
 check live state without printing environment secrets:
@@ -171,7 +171,7 @@ curl --fail http://127.0.0.1:8320/health
 
 the relay is one process with four jobs: sync encrypted bundles between devices, poll the Bot
 API, deliver the notification queue, and ferry assistant questions. all of it is relay code, laid
-out by domain in `relay/`: `server.py` (composition root, auth, `run`), `routes_*.py` (one http
+out by domain in this repository: `server.py` (composition root, auth, `run`), `routes_*.py` (one http
 domain per file, dispatched in order by `router.py`), `realtime.py` (websocket), `bot.py`,
 `assistant.py` + `assistant_actions.py`, `delivery.py`, `ai_proxy.py`, and `store/` (sqlite).
 `tg.py` stays the leaf it always was. this document describes the behaviour, not the file count,
@@ -179,7 +179,7 @@ so it holds across the split.
 
 **deploy the whole directory, not one file.** `cp server.py` is not enough any more: the process
 imports its siblings, so a half copied tree starts with `ModuleNotFoundError` on the first request
-that touches the missing module. ship `relay/*.py` plus `relay/store/` (and `requirements.txt`),
+that touches the missing module. ship `*.py` plus `store/` (and `requirements.txt`),
 then `systemctl restart slag-relay` and check `/health`.
 
 reminders leave the vault through the relay: the client arms a job, the relay calls the Bot
