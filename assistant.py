@@ -123,11 +123,21 @@ class AssistantDomain:
             await self._bot_reply(chat_id, "напиши вопрос текстом или /ask <вопрос>.",
                                   html="напиши вопрос текстом или <code>/ask &lt;вопрос&gt;</code>.")
             return
+        if len(BOT_LINK_RE.findall(question)) > BOT_MAX_LINKS:
+            await self._bot_reply(chat_id, "слишком много ссылок в одном сообщении.")
+            return
         if not self._allow_request(f"tg-ask:{chat_id}", RATE_LIMIT_TG_ASK):
             await self._bot_reply(chat_id, "слишком часто, подожди минуту.")
             return
         target = await self._linked_target(chat_id)
         if target is None:
+            return
+        # One question at a time per chat. The second message would queue behind the first on the
+        # same device, so the person would wait twice and read an answer to the older question —
+        # the lock is the unanswered row itself, and `finish_assistant_request` clears it.
+        tokens = [row["route_token"] for row in self.notify.routes_for_chat(chat_id)]
+        if self.db.pending_assistant_request_for_tokens(tokens, time.time()):
+            await self._bot_reply(chat_id, "подожди — предыдущее сообщение ещё обрабатывается.")
             return
         vault_id = target["vault_id"]
         mode = target["mode"]

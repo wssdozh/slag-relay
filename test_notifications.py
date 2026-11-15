@@ -1118,6 +1118,136 @@ class NotificationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertLess(job["fire_at"], fire_at)
 
 
+class BotGuardTestCase(unittest.IsolatedAsyncioTestCase):
+    """The chat-side guards: one question at a time, and a bot that is not an amplifier.
+
+    A second question used to queue behind the first on the same device, so the person waited
+    twice and read an answer to the older question. A replayed backlog, a link flood or a chat
+    hammering the bot did the same thing at the relay's expense.
+    """
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="slag_guard_")
+        self.db_path = os.path.join(self.tmpdir, "relay.db")
+        self.server = SlagRelayServer("127.0.0.1", 0, self.db_path, require_account_auth=False,
+                                      bot_token="", notify_pepper="test-pepper")
+        self.server.bot = FakeBot()
+        self.bot: FakeBot = self.server.bot
+        self.db = self.server.db
+        self.notify = self.server.notify
+        self.tag = self.server._notify_tag("vault-1")
+        # `chat-a` is the linked chat every happy-path guard test talks to.
+        self.notify.link("tok-a", "chat-a", "A", self.tag)
+        self.db.set_assistant_link("tok-a", "vault-1", True)
+        self.device = FakeDevice("dev-1", "vault-1", server=self.server)
+        self.server.rooms["room-1"] = {self.device}
+
+    async def asyncTearDown(self):
+        for task in list(self.server.typing_tasks.values()):
+            task.cancel()
+        if self.server.stage_tasks:
+            await asyncio.gather(*list(self.server.stage_tasks), return_exceptions=True)
+        self.db.conn.close()
+        self.notify.conn.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def count_requests(self) -> int:
+        return self.db.conn.execute("SELECT COUNT(*) AS n FROM assistant_requests").fetchone()["n"]
+
+    def update(self, chat_id: str, text: str, date: float | None = None,
+               sender: dict | None = None) -> dict:
+        message: dict = {"chat": {"id": chat_id, "type": "private"},
+                         "from": sender if sender is not None else {"id": chat_id},
+                         "text": text}
+        if date is not None:
+            message["date"] = date
+        return {"update_id": 500 + len(self.bot.calls), "message": message}
+
+    async def test_a_second_question_waits_instead_of_queueing_on_the_device(self):
+        await self.server._bot_question("chat-a", "первый вопрос")
+        first = self.db.conn.execute("SELECT * FROM assistant_requests").fetchone()
+        self.assertIsNotNone(first)
+        self.assertEqual(len(self.device.questions()), 1)
+        self.assertEqual(len(self.server.typing_tasks), 1)
+
+        await self.server._bot_question("chat-a", "второй вопрос")
+        self.assertEqual(self.bot.sent[-1],
+                         ("chat-a", "подожди — предыдущее сообщение ещё обрабатывается."))
+        # No request, no second placeholder, no typing: the lock is not a queue.
+        self.assertEqual(self.count_requests(), 1)
+        self.assertEqual(len(self.device.questions()), 1)
+        self.assertEqual(len(self.server.typing_tasks), 1)
+
+        # The answer clears the lock through `finish_assistant_request`, and the next question
+        # is a question again.
+        self.db.finish_assistant_request(first["id"])
+        await self.server._bot_question("chat-a", "третий вопрос")
+        self.assertEqual(self.count_requests(), 2)
+        self.assertEqual(len(self.device.questions()), 2)
+
+    async def test_an_expired_question_stops_blocking_the_chat(self):
+        await self.server._bot_question("chat-a", "первый вопрос")
+        request = self.db.conn.execute("SELECT * FROM assistant_requests").fetchone()
+        with self.db.conn:
+            self.db.conn.execute("UPDATE assistant_requests SET expires_at = ? WHERE id = ?",
+                                 (time.time() - 1, request["id"]))
+        await self.server._bot_question("chat-a", "второй вопрос")
+        # An expired row is dead even before the expiry loop sweeps it: it cannot hold the chat.
+        self.assertEqual(self.count_requests(), 2)
+
+    async def test_a_replayed_message_is_dropped_without_a_reply(self):
+        await self.server._handle_bot_update(
+            self.update("chat-a", "вчерашний вопрос", date=time.time() - 600))
+        # Silence on purpose: after downtime there may be a hundred of these, and each reply
+        # would be the relay talking to itself.
+        self.assertEqual(self.bot.sent, [])
+        self.assertEqual(self.count_requests(), 0)
+        self.assertEqual(self.device.questions(), [])
+        # A missing `date` is not stale: an old client or a test must keep working.
+        self.assertFalse(self.server._message_is_stale({"text": "без даты"}))
+        # And a fresh message carrying `date` is a normal question.
+        await self.server._handle_bot_update(
+            self.update("chat-a", "свежий вопрос", date=time.time()))
+        self.assertEqual(self.count_requests(), 1)
+        self.assertEqual(len(self.device.questions()), 1)
+
+    async def test_a_message_from_a_bot_is_ignored(self):
+        await self.server._handle_bot_update(
+            self.update("chat-a", "вопрос", date=time.time(),
+                        sender={"id": 9, "is_bot": True}))
+        self.assertEqual(self.bot.calls, [])
+        self.assertEqual(self.count_requests(), 0)
+        self.assertEqual(self.device.questions(), [])
+
+    async def test_a_question_that_is_mostly_links_is_refused(self):
+        await self.server._bot_question(
+            "chat-a", " ".join(f"https://example.com/{index}" for index in range(6)))
+        self.assertEqual(self.bot.sent[-1], ("chat-a", "слишком много ссылок в одном сообщении."))
+        self.assertEqual(self.count_requests(), 0)
+        self.assertEqual(self.device.questions(), [])
+        # Five is still a question: the limit is on the flood, not on citing sources.
+        await self.server._bot_question(
+            "chat-a", " ".join(f"http://example.com/{index}" for index in range(5)))
+        self.assertEqual(self.count_requests(), 1)
+        self.assertEqual(len(self.device.questions()), 1)
+
+    async def test_the_fifth_rapid_message_is_rejected_and_the_notice_is_budgeted(self):
+        for index in range(6):
+            await self.server._handle_bot_update(self.update("chat-b", f"сообщение {index}"))
+        texts = [text for _, text in self.bot.sent]
+        # The unlinked chat gets three pointers at the app, then silence; the fifth message
+        # crosses the burst limit and earns exactly one "too often" — the sixth gets nothing.
+        self.assertEqual(sum("включить" in text for text in texts), 3)
+        self.assertEqual(texts.count("слишком часто, подожди минуту."), 1)
+        self.assertEqual(len(texts), 4)
+
+    async def test_an_unlinked_chat_goes_silent_after_three_answers(self):
+        for index in range(4):
+            await self.server._handle_bot_update(self.update("chat-b", f"привет {index}"))
+        self.assertEqual(len(self.bot.sent), 3)
+        self.assertTrue(all("включить" in text for _, text in self.bot.sent))
+
+
 class AssistantSchemaMigrationTestCase(unittest.TestCase):
     """An existing relay database gains the action columns without losing what it holds.
 

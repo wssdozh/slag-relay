@@ -97,6 +97,23 @@ ASSISTANT_MAX_APPLY_TEXT = 300
 # a request row into a blob and a websocket frame into a stall.
 ASSISTANT_MAX_ACTION_JSON = 8192
 RATE_LIMIT_TG_ASK = 10
+# Bot flood control, all local. A burst window catches a paste storm, the hour catches a script.
+# The reply to a rejected message is itself budgeted: answering every rejected message is how a
+# flood guard turns into the amplifier.
+BOT_BURST_LIMIT = 4
+BOT_BURST_WINDOW_SECONDS = 15
+BOT_HOURLY_LIMIT = 40
+BOT_HOURLY_WINDOW_SECONDS = 3600
+BOT_FLOOD_NOTICE_SECONDS = 30
+# Telegram sets `date` on its own side, so a message older than this is not a fresh question: after
+# downtime `getUpdates` replays the backlog, and nobody wants an answer to yesterday's thought.
+BOT_STALE_MESSAGE_SECONDS = 120
+# An unlinked chat is a stranger: three pointers at the app, then silence instead of a megaphone.
+BOT_UNLINKED_LIMIT = 3
+# A question that is mostly links is a flood, not a question. Telegram clients lowercase the scheme,
+# but the check does not rely on that.
+BOT_MAX_LINKS = 5
+BOT_LINK_RE = re.compile(r"https?://", re.IGNORECASE)
 # Delivery telemetry: outcomes and latencies, never the text of a question or an answer.
 DELIVERY_EVENT_KEEP_SECONDS = 7 * 86400
 NOTIFY_BATCH_SIZE = 50
