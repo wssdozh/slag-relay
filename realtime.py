@@ -55,12 +55,10 @@ class Realtime:
             logger.info("WebSocket connected")
             await conn.send_text(json.dumps({"type": "welcome", "deviceId": device_id, "roomId": room_id,
                                              "connectedDevices": len(self.rooms[room_id]), "binary": True}))
-            for item in self.db.get_pending_bundles(room_id, device_id):
-                self._check_ws_auth(conn)
-                bundle_payload = item["payload"]
-                if isinstance(bundle_payload, dict):
-                    bundle_payload["syncId"] = item.get("syncId", 0)
-                await conn.send_text(json.dumps({"type": "bundle", "bundle": bundle_payload}))
+            # The backlog goes out in the background. Sending it inline blocked the frame loop:
+            # a Pi pulling a week of bundles for two minutes could not land a single ACK, so the
+            # relay re-delivered the same page forever and the cursor never moved.
+            dump_task = asyncio.create_task(self._send_backlog(conn))
             try:
                 while not conn.closed:
                     frame = await conn.read_frame()
@@ -77,6 +75,7 @@ class Realtime:
                     elif opcode == 0x2:
                         await self._handle_ws_binary(conn, payload)
             finally:
+                dump_task.cancel()
                 if room_id in self.rooms:
                     self.rooms[room_id].discard(conn)
                     if not self.rooms[room_id]:
@@ -88,6 +87,28 @@ class Realtime:
         except Exception as exc:
             logger.debug("WS error: %s", type(exc).__name__)
             writer.close()
+
+    async def _send_backlog(self, conn: WebSocketConnection) -> None:
+        """Hand over the unacknowledged bundles while the frame loop keeps reading ACKs.
+
+        A page of a week-old backlog is megabytes, and a node on a slow link needs minutes for
+        it. That time used to be a black hole for acknowledgements, so nothing ever left the
+        pending set. Delivery order stays oldest first: a device that dies halfway has moved
+        its confirmed window forward, not restarted.
+        """
+        try:
+            for item in self.db.get_pending_bundles(conn.room_id, conn.device_id):
+                if conn.closed:
+                    return
+                self._check_ws_auth(conn)
+                bundle_payload = item["payload"]
+                if isinstance(bundle_payload, dict):
+                    bundle_payload["syncId"] = item.get("syncId", 0)
+                await conn.send_text(json.dumps({"type": "bundle", "bundle": bundle_payload}))
+        except asyncio.CancelledError:
+            raise
+        except ApiError:
+            await conn.close()
 
     def _check_ws_auth(self, conn: WebSocketConnection, write: bool = False) -> None:
         if conn.token_hash:
@@ -139,7 +160,12 @@ class Realtime:
         if msg_type == "ack":
             bundle_ids = msg.get("bundleIds") or ([msg.get("bundleId")] if msg.get("bundleId") else [])
             if bundle_ids:
-                self.db.record_acks(conn.device_id, bundle_ids, conn.room_id)
+                recorded = self.db.record_acks(conn.device_id, bundle_ids, conn.room_id)
+                if recorded < len(bundle_ids):
+                    # A bundle that ran out of TTL can never be acknowledged; it is re-sent until
+                    # the cleaner drops the row. Silence here is how that looked like a lost ACK.
+                    logger.debug("ACK partial device=%s recorded=%s of=%s",
+                                 conn.device_id, recorded, len(bundle_ids))
             return
         if msg_type == "bundle":
             bundle = msg.get("bundle", {})

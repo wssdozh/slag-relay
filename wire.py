@@ -55,13 +55,15 @@ class WebSocketConnection:
         self.closed = False
         self.token_hash = None
         self.vault_id = None
+        # The backlog dump and the frame loop write to this socket from two places now, so a
+        # frame is written whole or not at all: halves of two frames used to interleave.
+        self.send_lock = asyncio.Lock()
         # Last time this socket said anything at all. The handshake counts: a device that just
         # connected is alive even before its first ping.
         self.last_frame_at = time.monotonic()
 
-    async def send_text(self, text: str) -> None:
-        if self.closed:
-            return
+    @staticmethod
+    def _text_frame(text: str) -> bytes:
         payload = text.encode("utf-8")
         length = len(payload)
         header = bytearray([0x81])
@@ -73,11 +75,23 @@ class WebSocketConnection:
         else:
             header.append(127)
             header.extend(struct.pack("!Q", length))
-        try:
-            self.writer.write(header + payload)
-            await self.writer.drain()
-        except (ConnectionResetError, BrokenPipeError):
-            self.closed = True
+        return bytes(header) + payload
+
+    async def send_text(self, text: str) -> None:
+        await self.send_raw(self._text_frame(text))
+
+    async def send_raw(self, frame: bytes) -> None:
+        """One frame per lock hold: a slow reader blocks its own writer, not the reader loop."""
+        if self.closed:
+            return
+        async with self.send_lock:
+            if self.closed:
+                return
+            try:
+                self.writer.write(frame)
+                await self.writer.drain()
+            except (ConnectionResetError, BrokenPipeError):
+                self.closed = True
 
     async def read_frame(self) -> Optional[Tuple[int, bytes]]:
         try:
@@ -100,8 +114,8 @@ class WebSocketConnection:
             if opcode == 0x8:
                 return opcode, b""
             if opcode == 0x9:
-                self.writer.write(bytearray([0x8A, len(payload)]) + payload)
-                await self.writer.drain()
+                # Same lock as the backlog dump: a pong must not land inside a bundle frame.
+                await self.send_raw(bytes([0x8A, len(payload)]) + payload)
                 return await self.read_frame()
             return opcode, bytes(payload)
         except (asyncio.IncompleteReadError, ConnectionResetError):
@@ -110,10 +124,11 @@ class WebSocketConnection:
     async def close(self) -> None:
         if self.closed:
             return
+        # No send lock and no drain: a reader that stopped reading would hold the lock forever,
+        # and the peer is going away anyway — a truncated frame behind a close is fine.
         self.closed = True
         try:
-            self.writer.write(bytearray([0x88, 0x00]))
-            await self.writer.drain()
+            self.writer.write(bytes([0x88, 0x00]))
             self.writer.close()
             await self.writer.wait_closed()
         except Exception:
