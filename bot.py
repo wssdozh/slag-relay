@@ -105,11 +105,29 @@ class BotDomain:
         chat_id = str(chat.get("id") or "")
         if not chat_id:
             return
+        # A bot talking to a bot is never a person asking, and answering it is a loop.
+        if (message.get("from") or {}).get("is_bot"):
+            return
         sender = str((message.get("from") or {}).get("id") or chat_id)
         text = (message.get("text") or "").strip()
         if not text:
             return
-        if not text.startswith("/"):
+        is_command = text.startswith("/")
+        # An update replayed after downtime is history, not a question. Checked before the flood
+        # budget on purpose: the backlog must not spend the live chat's messages, and it must not
+        # be answered at all — dropping it silently is the whole point of the guard.
+        if not is_command and self._message_is_stale(message):
+            return
+        if not self._allow_request(f"tg-burst:{chat_id}", BOT_BURST_LIMIT, BOT_BURST_WINDOW_SECONDS) \
+                or not self._allow_request(f"tg-hour:{chat_id}", BOT_HOURLY_LIMIT,
+                                           BOT_HOURLY_WINDOW_SECONDS):
+            # The refusal is budgeted on its own: a rejected message gets at most one answer per
+            # window, so a flood is never paid back with a flood. Commands are budgeted too — a
+            # script hammering `/start` is still a script.
+            if self._allow_request(f"tg-flood-notice:{chat_id}", 1, BOT_FLOOD_NOTICE_SECONDS):
+                await self._bot_reply(chat_id, "слишком часто, подожди минуту.")
+            return
+        if not is_command:
             # Anything that is not a command is a question for the vault's assistant.
             message_id = message.get("message_id")
             await self._bot_question(chat_id, text, message_id if isinstance(message_id, int) else None)
@@ -141,6 +159,19 @@ class BotDomain:
                      "обычное сообщение уходит на устройство с открытым хранилищем, ответ придёт сюда же.\n"
                      "<code>/clear</code> — забыть, о чём говорили.\n"
                      "<code>/stop</code> — отписаться.")
+
+    @staticmethod
+    def _message_is_stale(message: dict) -> bool:
+        """Whether Telegram handed back a message from the backlog, not from this conversation.
+
+        `date` is set by Telegram, not by the sender, so it can be trusted. An update without it
+        (an old client, a test) is treated as fresh rather than dropped on a missing field. The
+        command path never asks: `/start` after downtime is exactly the message that must land.
+        """
+        sent_at = message.get("date")
+        if not isinstance(sent_at, (int, float)) or isinstance(sent_at, bool):
+            return False
+        return time.time() - float(sent_at) > BOT_STALE_MESSAGE_SECONDS
 
     async def _bot_start(self, chat_id: str, sender: str, code: str, message: dict) -> None:
         if not code:
@@ -281,6 +312,10 @@ class BotDomain:
         """
         linked = [row for row in self.notify.routes_for_chat(chat_id) if self.db.assistant_link(row["route_token"])]
         if not linked:
+            # A chat with no assistant is a stranger: the first few messages get the one useful
+            # answer, the rest get silence instead of a megaphone pointed at the relay.
+            if not self._allow_request(f"tg-unlinked:{chat_id}", BOT_UNLINKED_LIMIT):
+                return None
             await self._bot_reply(chat_id, "ассистента отсюда нужно включить: настройки → уведомления → "
                                            "ассистент в telegram.",
                                   html="ассистента отсюда нужно включить: "

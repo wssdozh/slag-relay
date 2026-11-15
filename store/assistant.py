@@ -104,6 +104,23 @@ class AssistantMixin:
             "SELECT * FROM assistant_requests WHERE answered_at IS NULL AND expires_at <= ? LIMIT ?",
             (now, limit)).fetchall()
 
+    def pending_assistant_request_for_tokens(self, tokens: list[str], now: float) -> Optional[sqlite3.Row]:
+        """The live question of one chat, if it has one: the chat's single-flight lock.
+
+        A chat's route tokens are the only thing a question is keyed by, and a second question
+        sent while the first is pending queues behind it on the same device. The lock is the row
+        itself: `finish_assistant_request` (answer or expiry) clears `answered_at`, and `now`
+        keeps an expired-but-not-yet-swept row from blocking the chat forever.
+        """
+        tokens = [token for token in tokens if token]
+        if not tokens:
+            return None
+        placeholders = ",".join("?" for _ in tokens)
+        return self.conn.execute(
+            "SELECT * FROM assistant_requests WHERE route_token IN (" + placeholders + ")"
+            " AND answered_at IS NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
+            (*tokens, now)).fetchone()
+
     def pending_assistant_requests(self, vault_id: str, now: float) -> list[sqlite3.Row]:
         """What a reconnecting device missed: the socket broadcast does not survive a reconnect."""
         return self.conn.execute(
