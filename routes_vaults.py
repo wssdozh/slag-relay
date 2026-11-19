@@ -233,9 +233,14 @@ class VaultRoutes:
                     since_sync_id = int(query.get("since", "0"))
                 except (ValueError, TypeError):
                     since_sync_id = 0
-                max_bytes = _bundle_page_budget(query.get("maxBytes"))
+                if "maxBytes" not in query:
+                    # Old clients treat any short page as EOF. Only opt-in clients can
+                    # distinguish a page cut by bytes from the end of the backlog.
+                    bundles = self.db.get_pending_bundles(room_id, device_id, limit, since_sync_id)
+                    return {"bundles": bundles, **self.db.get_room_watermarks(room_id)}, 200
                 bundles, page_bytes = self.db.get_pending_bundles_page(
-                    room_id, device_id, limit, since_sync_id=since_sync_id, max_bytes=max_bytes)
+                    room_id, device_id, limit, since_sync_id=since_sync_id,
+                    max_bytes=_bundle_page_budget(query["maxBytes"]))
                 return {"bundles": bundles, "bytes": page_bytes,
                         **self.db.get_room_watermarks(room_id)}, 200
 

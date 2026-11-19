@@ -109,6 +109,17 @@ class BacklogAckTest(unittest.IsolatedAsyncioTestCase):
         finally:
             writer.close()
 
+    async def test_http_backlog_opt_in_keeps_socket_responsive_without_dumping_bundles(self):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        try:
+            await open_ws(reader, writer, f"/ws/{ROOM}?device={ME}&vault={VAULT}&backlog=http")
+            self.assertEqual((await read_frame(reader))["type"], "welcome")
+            writer.write(ws_frame(json.dumps({"type": "ping"}).encode()))
+            await writer.drain()
+            self.assertEqual((await asyncio.wait_for(read_frame(reader), timeout=5))["type"], "pong")
+        finally:
+            writer.close()
+
     async def test_backlog_is_delivered_and_drains_after_acks(self):
         """Читающий клиент получает всю страницу, а подтверждённое больше не приходит."""
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)

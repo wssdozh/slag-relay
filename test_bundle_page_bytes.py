@@ -90,10 +90,11 @@ class BundlePageBytesTest(RelayTestCase):
         # Дефолт 2 МБ: первый (~1.5 МБ) влезает, второй уже нет.
         self.assertEqual(len(result["bundles"]), 1)
         self.assertLessEqual(result["bytes"], 2_000_000)
-        # Без параметра действует тот же дефолт, а не «без ограничения».
-        status, defaulted = await self.http("GET", f"/api/rooms/{room}/bundles?device={ME}")
+        # Старый клиент не запрашивает бюджет и считает короткую страницу концом ленты.
+        status, legacy = await self.http("GET", f"/api/rooms/{room}/bundles?device={ME}")
         self.assertEqual(status, 200)
-        self.assertEqual(len(defaulted["bundles"]), 1)
+        self.assertEqual(len(legacy["bundles"]), 2)
+        self.assertNotIn("bytes", legacy)
 
     async def test_max_bytes_is_clamped_to_bounds(self):
         room = "bytes-clamp-room"

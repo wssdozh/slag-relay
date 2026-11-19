@@ -58,7 +58,9 @@ class Realtime:
             # The backlog goes out in the background. Sending it inline blocked the frame loop:
             # a Pi pulling a week of bundles for two minutes could not land a single ACK, so the
             # relay re-delivered the same page forever and the cursor never moved.
-            dump_task = asyncio.create_task(self._send_backlog(conn))
+            # New clients drain the backlog over paged HTTP; sending it twice chokes slow links.
+            dump_task = (None if query.get("backlog") == "http"
+                         else asyncio.create_task(self._send_backlog(conn)))
             try:
                 while not conn.closed:
                     frame = await conn.read_frame()
@@ -75,7 +77,8 @@ class Realtime:
                     elif opcode == 0x2:
                         await self._handle_ws_binary(conn, payload)
             finally:
-                dump_task.cancel()
+                if dump_task is not None:
+                    dump_task.cancel()
                 if room_id in self.rooms:
                     self.rooms[room_id].discard(conn)
                     if not self.rooms[room_id]:
