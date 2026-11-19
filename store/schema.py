@@ -274,3 +274,13 @@ def apply_schema(conn: sqlite3.Connection) -> None:
             body TEXT NOT NULL,
             updated_at REAL NOT NULL
         )""")
+        # The same manifest per device: one row per (room, device) so two machines stop
+        # overwriting each other's roots. `room_manifests` stays as the legacy/anonymous row.
+        conn.execute("""CREATE TABLE IF NOT EXISTS room_device_manifests (
+            room_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            sync_id INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (room_id, device_id)
+        )""")

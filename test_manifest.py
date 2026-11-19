@@ -278,6 +278,164 @@ class ManifestTestCase(unittest.IsolatedAsyncioTestCase):
                                       {"vault": "upd-v", "since": "2"}, {}, token)
         self.assertEqual(s, 204)
 
+    # --- Тесты манифеста на устройство (?device=) ---
+
+    async def test_devices_do_not_overwrite_each_other(self):
+        """Два устройства пишут свои корни, GET отдаёт чужой и не отдаёт свой."""
+        room, vault, token = "pd-r", "pd-v", "tok-pd-d"
+        self.setup_room_with_vault(room, vault, token)
+        path = f"/api/rooms/{room}/manifest"
+
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "A"},
+                                      {"v": 1, "root": "aaaa", "folders": {"a": "1"}}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["syncId"], 1)
+
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "B"},
+                                      {"v": 1, "root": "bbbb", "folders": {"b": "2"}}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["syncId"], 2)
+
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "A"}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual([m["deviceId"] for m in b["manifests"]], ["B"])
+        self.assertEqual(b["manifests"][0]["root"], "bbbb")
+        self.assertEqual(b["manifests"][0]["folders"], {"b": "2"})
+        self.assertEqual(b["manifests"][0]["syncId"], 2)
+        self.assertIsNone(b["anonymous"])
+
+        # Записи с device не создают legacy-строку: старый клиент по-прежнему видит 404.
+        s, b = await self.call_route("GET", room, vault, path, {"vault": vault}, {}, token)
+        self.assertEqual(s, 404, b)
+
+    async def test_legacy_row_is_anonymous_for_device_reads(self):
+        """POST без device пишет в старую таблицу, а GET с device зовёт её anonymous."""
+        room, vault, token = "lga-r", "lga-v", "tok-lga-d"
+        self.setup_room_with_vault(room, vault, token)
+        path = f"/api/rooms/{room}/manifest"
+
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault},
+                                      {"v": 1, "root": "legacy01", "folders": {"l": "9"}}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["syncId"], 1)
+
+        s, b = await self.call_route("GET", room, vault, path, {"vault": vault}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["root"], "legacy01")
+        self.assertEqual(b["folders"], {"l": "9"})
+        self.assertEqual(b["syncId"], 1)
+
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "A"}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["manifests"], [])
+        self.assertEqual(b["anonymous"]["root"], "legacy01")
+        self.assertEqual(b["anonymous"]["folders"], {"l": "9"})
+        self.assertEqual(b["anonymous"]["syncId"], 1)
+
+        # И наоборот: запись с device не перетирает legacy-строку.
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "A"},
+                                      {"v": 1, "root": "aaaa", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+        s, b = await self.call_route("GET", room, vault, path, {"vault": vault}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["root"], "legacy01")
+
+    async def test_device_leaves_travel_back(self):
+        """leaves доезжают в чужой элемент manifests[], а без них ключа нет."""
+        room, vault, token = "pdl-r", "pdl-v", "tok-pdl-d"
+        self.setup_room_with_vault(room, vault, token)
+        path = f"/api/rooms/{room}/manifest"
+
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "A"},
+                                      {"v": 1, "root": "aaaa", "folders": {},
+                                       "leaves": {"item_1": "1111"}}, token)
+        self.assertEqual(s, 200, b)
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "B"},
+                                      {"v": 1, "root": "bbbb", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "B"}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(len(b["manifests"]), 1)
+        self.assertEqual(b["manifests"][0]["deviceId"], "A")
+        self.assertEqual(b["manifests"][0]["leaves"], {"item_1": "1111"})
+
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "A"}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertNotIn("leaves", b["manifests"][0])
+
+    async def test_device_since_future_returns_204(self):
+        """since >= максимального sync_id чужих записей → 204 и в новом режиме."""
+        room, vault, token = "pds-r", "pds-v", "tok-pds-d"
+        self.setup_room_with_vault(room, vault, token)
+        path = f"/api/rooms/{room}/manifest"
+
+        for dev in ("A", "B"):
+            s, _ = await self.call_route("POST", room, vault, path,
+                                          {"vault": vault, "device": dev},
+                                          {"v": 1, "root": dev * 4, "folders": {}}, token)
+            self.assertEqual(s, 200)
+
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "A", "since": "2"}, {}, token)
+        self.assertEqual(s, 204, b)
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "A", "since": "999"}, {}, token)
+        self.assertEqual(s, 204, b)
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "A", "since": "1"}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["manifests"][0]["syncId"], 2)
+
+    async def test_payload_carries_publication_time(self):
+        """`at` — миллисекунды: целое больше нуля и не уменьшается при перезаписи."""
+        room, vault, token = "pt-r", "pt-v", "tok-pt-d"
+        self.setup_room_with_vault(room, vault, token)
+        path = f"/api/rooms/{room}/manifest"
+
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault},
+                                      {"v": 1, "root": "legacy01", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "A"},
+                                      {"v": 1, "root": "aaaa", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+
+        s, b = await self.call_route("GET", room, vault, path, {"vault": vault}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertIsInstance(b["at"], int)
+        self.assertGreater(b["at"], 0)
+
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "B"}, {}, token)
+        self.assertEqual(s, 200, b)
+        first_at = b["manifests"][0]["at"]
+        self.assertIsInstance(first_at, int)
+        self.assertGreater(first_at, 0)
+        self.assertIsInstance(b["anonymous"]["at"], int)
+        self.assertGreater(b["anonymous"]["at"], 0)
+
+        time.sleep(0.01)
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "A"},
+                                      {"v": 1, "root": "aaaa2", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "B"}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertGreaterEqual(b["manifests"][0]["at"], first_at)
+
     async def test_without_folders_accepted(self):
         """leaves необязательны — принимаем без folders."""
         room, vault, token = "nl-r", "nl-v", "tok-nl-d"
