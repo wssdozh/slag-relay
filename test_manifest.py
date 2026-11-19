@@ -397,6 +397,45 @@ class ManifestTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s, 200, b)
         self.assertEqual(b["manifests"][0]["syncId"], 2)
 
+    async def test_payload_carries_publication_time(self):
+        """`at` — миллисекунды: целое больше нуля и не уменьшается при перезаписи."""
+        room, vault, token = "pt-r", "pt-v", "tok-pt-d"
+        self.setup_room_with_vault(room, vault, token)
+        path = f"/api/rooms/{room}/manifest"
+
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault},
+                                      {"v": 1, "root": "legacy01", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "A"},
+                                      {"v": 1, "root": "aaaa", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+
+        s, b = await self.call_route("GET", room, vault, path, {"vault": vault}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertIsInstance(b["at"], int)
+        self.assertGreater(b["at"], 0)
+
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "B"}, {}, token)
+        self.assertEqual(s, 200, b)
+        first_at = b["manifests"][0]["at"]
+        self.assertIsInstance(first_at, int)
+        self.assertGreater(first_at, 0)
+        self.assertIsInstance(b["anonymous"]["at"], int)
+        self.assertGreater(b["anonymous"]["at"], 0)
+
+        time.sleep(0.01)
+        s, b = await self.call_route("POST", room, vault, path,
+                                      {"vault": vault, "device": "A"},
+                                      {"v": 1, "root": "aaaa2", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+        s, b = await self.call_route("GET", room, vault, path,
+                                      {"vault": vault, "device": "B"}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertGreaterEqual(b["manifests"][0]["at"], first_at)
+
     async def test_without_folders_accepted(self):
         """leaves необязательны — принимаем без folders."""
         room, vault, token = "nl-r", "nl-v", "tok-nl-d"

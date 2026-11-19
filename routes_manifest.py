@@ -68,9 +68,15 @@ def _parse_manifest_body(body) -> dict:
     return stored
 
 
-def _manifest_payload(parsed: dict, sync_id: int, **extra) -> dict:
-    """Элемент ответа манифеста: базовые поля плюс leaves, если они были сохранены."""
-    item = {"root": parsed["root"], "folders": parsed["folders"], "syncId": sync_id}
+def _manifest_payload(parsed: dict, sync_id: int, updated_at: float, **extra) -> dict:
+    """Элемент ответа манифеста: базовые поля плюс leaves, если они были сохранены.
+
+    `at` — когда строку последний раз записали, в миллисекундах: клиент сравнивает его
+    с `Date.now()` напрямую и отличает «сосед отверг заметку» от «сосед ещё не
+    переопубликовал корень после моей переотправки».
+    """
+    item = {"root": parsed["root"], "folders": parsed["folders"], "syncId": sync_id,
+            "at": int(updated_at * 1000)}
     if "leaves" in parsed:
         item["leaves"] = parsed["leaves"]
     item.update(extra)
@@ -162,7 +168,7 @@ class ManifestRoutes:
 
         Без device — прежний ответ `{v, root, folders, syncId}`. С device — каталог
         чужих манифестов комнаты:
-        `{v, manifests: [{deviceId, root, folders, [leaves], syncId}], anonymous}`.
+        `{v, manifests: [{deviceId, root, folders, [leaves], syncId, at}], anonymous}`.
 
         204 отправляем напрямую через _send_response(writer, ...), так как рутер не
         умеет кортежи с заголовками, а json.dumps(None) ≠ пустое тело.
@@ -171,7 +177,7 @@ class ManifestRoutes:
             return await self._get_device_manifests(room_id, since, writer, device)
 
         row = self.db.conn.execute(
-            "SELECT sync_id, body FROM room_manifests WHERE room_id = ?",
+            "SELECT sync_id, body, updated_at FROM room_manifests WHERE room_id = ?",
             (room_id,),
         ).fetchone()
         if not row:
@@ -183,7 +189,8 @@ class ManifestRoutes:
             return None
 
         parsed = json.loads(row["body"])
-        return {"v": parsed["v"], **_manifest_payload(parsed, row["sync_id"])}, 200
+        return {"v": parsed["v"],
+                **_manifest_payload(parsed, row["sync_id"], row["updated_at"])}, 200
 
     async def _get_device_manifests(self, room_id: str, since: int, writer,
                                     device: str) -> Optional[tuple]:
@@ -194,13 +201,13 @@ class ManifestRoutes:
         записался, должен отличать «соседей пока нет» от «манифеста нет вообще».
         """
         rows = self.db.conn.execute("""
-            SELECT device_id, sync_id, body FROM room_device_manifests
+            SELECT device_id, sync_id, body, updated_at FROM room_device_manifests
             WHERE room_id = ? AND device_id <> ?
             ORDER BY sync_id
         """, (room_id, device)).fetchall()
 
         legacy = self.db.conn.execute(
-            "SELECT sync_id, body FROM room_manifests WHERE room_id = ?",
+            "SELECT sync_id, body, updated_at FROM room_manifests WHERE room_id = ?",
             (room_id,),
         ).fetchone()
 
@@ -214,13 +221,14 @@ class ManifestRoutes:
         manifests = []
         for r in rows:
             parsed = json.loads(r["body"])
-            manifests.append(_manifest_payload(parsed, r["sync_id"],
+            manifests.append(_manifest_payload(parsed, r["sync_id"], r["updated_at"],
                                                deviceId=r["device_id"]))
 
         anonymous = None
         if legacy:
             parsed = json.loads(legacy["body"])
             anonymous = {"root": parsed["root"], "folders": parsed["folders"],
-                         "syncId": legacy["sync_id"]}
+                         "syncId": legacy["sync_id"],
+                         "at": int(legacy["updated_at"] * 1000)}
 
         return {"v": 1, "manifests": manifests, "anonymous": anonymous}, 200
