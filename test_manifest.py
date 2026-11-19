@@ -112,11 +112,41 @@ class ManifestTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b["folders"]["docs"], "eeff0011")
         self.assertEqual(b["syncId"], 1)
 
+    async def test_leaves_travel_back(self):
+        """Листья хранятся и возвращаются: по ним клиент называет расхождение."""
+        room, vault, token = "lv-room", "lv-vault", "tok-lv-device"
+        self.setup_room_with_vault(room, vault, token)
+
+        manifest = {"v": 1, "root": "aabbccdd", "folders": {"docs": "eeff0011"},
+                    "leaves": {"item_1": "1111", "item_2": "2222"}}
+        s, b = await self.call_route("POST", room, vault, f"/api/rooms/{room}/manifest",
+                                     {"vault": vault}, manifest, token)
+        self.assertEqual(s, 200, b)
+
+        s, b = await self.call_route("GET", room, vault, f"/api/rooms/{room}/manifest",
+                                     {"vault": vault}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["leaves"], {"item_1": "1111", "item_2": "2222"})
+
+    async def test_without_leaves_keeps_the_old_shape(self):
+        """Старый отправитель листьев не шлёт — тело остаётся прежним, без пустого ключа."""
+        room, vault, token = "nl-room", "nl-vault", "tok-nl-device"
+        self.setup_room_with_vault(room, vault, token)
+
+        s, b = await self.call_route("POST", room, vault, f"/api/rooms/{room}/manifest",
+                                     {"vault": vault},
+                                     {"v": 1, "root": "aabbccdd", "folders": {}}, token)
+        self.assertEqual(s, 200, b)
+
+        s, b = await self.call_route("GET", room, vault, f"/api/rooms/{room}/manifest",
+                                     {"vault": vault}, {}, token)
+        self.assertEqual(s, 200, b)
+        self.assertNotIn("leaves", b)
+
     async def test_unauthorized_device_rejected(self):
         """Отказ чужому токену."""
         room, vault, own_tok = "ur-room", "ur-vault", "tok-ur-owner"
         self.setup_room_with_vault(room, vault, own_tok)
-        
         other_tok = "tok-ur-other"
         s, b = await self.call_route("POST", room, vault, f"/api/rooms/{room}/manifest",
                                        {"vault": vault}, {"v": 1, "root": "abc", "folders": {}}, other_tok)

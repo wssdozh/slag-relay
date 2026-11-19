@@ -80,7 +80,19 @@ class ManifestRoutes:
         folders = {k: v for k, v in folders_raw.items()
                    if isinstance(k, str) and isinstance(v, str)}
 
-        manifest_body = json.dumps({"v": 1, "root": root, "folders": folders})
+        # Leaves are what lets a client name the divergence instead of shrugging at it: "the
+        # neighbour has no note <id>" is the difference between a stale note and a broken replica.
+        # Optional — an older sender sends none, and the body then stays exactly as before.
+        leaves_raw = body.get("leaves", {})
+        if not isinstance(leaves_raw, dict):
+            raise ApiError(400, "invalid_manifest_leaves")
+        leaves = {k: v for k, v in leaves_raw.items()
+                  if isinstance(k, str) and isinstance(v, str)}
+
+        stored = {"v": 1, "root": root, "folders": folders}
+        if leaves:
+            stored["leaves"] = leaves
+        manifest_body = json.dumps(stored)
 
         with self.db.conn:
             max_row = self.db.conn.execute(
@@ -122,4 +134,6 @@ class ManifestRoutes:
         parsed = json.loads(row["body"])
         result = {"v": parsed["v"], "root": parsed["root"],
                   "folders": parsed["folders"], "syncId": row["sync_id"]}
+        if "leaves" in parsed:
+            result["leaves"] = parsed["leaves"]
         return result, 200
