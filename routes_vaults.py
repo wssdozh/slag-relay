@@ -23,6 +23,23 @@ from assistant_card import *
 from router import _NEXT
 
 
+# A page is capped by payload bytes, not by bundle count: one bundle can carry a 6 MB
+# attachment (base64 → ~8 MB of JSON), so the old count-only page could reach hundreds of
+# megabytes and clients died on their own AbortSignal.timeout.
+BUNDLE_PAGE_DEFAULT_BYTES = 2_000_000
+BUNDLE_PAGE_MIN_BYTES = 100_000
+BUNDLE_PAGE_MAX_BYTES = 16_000_000
+
+
+def _bundle_page_budget(raw) -> int:
+    """Client-requested page budget in payload bytes; garbage means the default, not a 500."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return BUNDLE_PAGE_DEFAULT_BYTES
+    return max(BUNDLE_PAGE_MIN_BYTES, min(BUNDLE_PAGE_MAX_BYTES, value))
+
+
 class VaultRoutes:
     async def _route_vaults(self, method: str, path: str, query: dict, body: dict,
                      headers: dict, writer):
@@ -216,8 +233,11 @@ class VaultRoutes:
                     since_sync_id = int(query.get("since", "0"))
                 except (ValueError, TypeError):
                     since_sync_id = 0
-                bundles = self.db.get_pending_bundles(room_id, device_id, limit, since_sync_id=since_sync_id)
-                return {"bundles": bundles, **self.db.get_room_watermarks(room_id)}, 200
+                max_bytes = _bundle_page_budget(query.get("maxBytes"))
+                bundles, page_bytes = self.db.get_pending_bundles_page(
+                    room_id, device_id, limit, since_sync_id=since_sync_id, max_bytes=max_bytes)
+                return {"bundles": bundles, "bytes": page_bytes,
+                        **self.db.get_room_watermarks(room_id)}, 200
 
             if method == "POST" and action == "ack":
                 device_id = body.get("deviceId", "")
