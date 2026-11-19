@@ -73,6 +73,7 @@ from routes_admin_ops import AdminOpsRoutes
 from routes_auth import AuthRoutes
 from routes_notify import NotifyRoutes
 from routes_vaults import VaultRoutes
+from routes_manifest import ManifestRoutes
 from routes_ai import AiRoutes
 from routes_static import StaticRoutes
 
@@ -80,7 +81,7 @@ from routes_static import StaticRoutes
 class SlagRelayServer(
     HttpPlumbing, HttpRouter,          # чтение запроса, ответы, диспетчер по доменам
     HealthRoutes, PublicRoutes, AdminRoutes, AdminOpsRoutes, AuthRoutes,   # http-домены
-    NotifyRoutes, VaultRoutes, AiRoutes, StaticRoutes,
+    NotifyRoutes, VaultRoutes, ManifestRoutes, AiRoutes, StaticRoutes,
     Realtime,                          # websocket: кадры, бандлы, рассылка
     BotDomain, AssistantDomain, AssistantActions, DeliveryDomain, AiProxy,  # telegram и модели
 ):

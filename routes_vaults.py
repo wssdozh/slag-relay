@@ -170,7 +170,7 @@ class VaultRoutes:
             parts = path.strip("/").split("/")
             room_id, action = urllib.parse.unquote(parts[2]), parts[3]
             if action not in ("bundle", "bundles", "ack"):
-                return {"error": "not_found", "path": path}, 404
+                return _NEXT
             auth = owner_account_id = vault_id = None
             max_cache = self.db.DEFAULT_MAX_CACHE_BYTES
             room_vault = self.db.room_vault(room_id)

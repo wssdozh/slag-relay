@@ -267,3 +267,10 @@ def apply_schema(conn: sqlite3.Connection) -> None:
             error_code TEXT
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_events_at ON delivery_events(at)")
+        # Room manifest: append-only directory index with sync id for clients to catch up.
+        conn.execute("""CREATE TABLE IF NOT EXISTS room_manifests (
+            room_id TEXT PRIMARY KEY,
+            sync_id INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
