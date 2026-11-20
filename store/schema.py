@@ -284,3 +284,41 @@ def apply_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             PRIMARY KEY (room_id, device_id)
         )""")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS note_rooms (
+                room_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL CHECK (mode IN ('legacy', 'frozen', 'registry')),
+                generation INTEGER NOT NULL,
+                head INTEGER NOT NULL DEFAULT 0,
+                floor INTEGER NOT NULL DEFAULT 0,
+                bytes INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS note_versions (
+                room_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                note_id TEXT NOT NULL,
+                op_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                base_revision INTEGER NOT NULL,
+                iv TEXT NOT NULL,
+                ciphertext TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (room_id, revision)
+            );
+            CREATE TABLE IF NOT EXISTS note_heads (
+                room_id TEXT NOT NULL,
+                note_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                PRIMARY KEY (room_id, note_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_note_heads_revision ON note_heads (room_id, revision);
+            CREATE TABLE IF NOT EXISTS note_receipts (
+                room_id TEXT NOT NULL,
+                op_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                digest BLOB NOT NULL,
+                revision INTEGER NOT NULL,
+                PRIMARY KEY (room_id, op_id)
+            );
+        """)

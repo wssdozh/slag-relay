@@ -38,22 +38,23 @@ class BundlesMixin:
     def save_bundle(self, room_id: str, bundle_id: str, from_device: str, seq: int, ts: str,
                     payload_json: str, ttl: int = DEFAULT_TTL_SECONDS,
                     max_cache_bytes: int = MAX_CACHE_BYTES, account_id: Optional[str] = None,
-                    vault_id: Optional[str] = None) -> bool:
+                    vault_id: Optional[str] = None, note_generation: Optional[int] = None) -> int | bool:
         if not isinstance(bundle_id, str) or not bundle_id or len(bundle_id) > 256:
             raise ApiError(400, "invalid_bundle_id")
-        if self.conn.execute("SELECT 1 FROM bundle_receipts WHERE bundle_id = ?", (bundle_id,)).fetchone():
-            raise ApiError(409, "bundle_replay")
-        room = self.conn.execute("SELECT vault_id, retired FROM rooms WHERE room_id = ?", (room_id,)).fetchone()
-        if room and (room["vault_id"] != vault_id or room["retired"]):
-            raise ApiError(403, "room_binding_conflict")
         payload_len = len(payload_json.encode("utf-8"))
-        current_cache = self.get_account_cache_bytes(account_id) if account_id else self.get_room_cache_bytes(room_id)
-        if current_cache + payload_len > max_cache_bytes:
-            logger.warning("Cache limit exceeded")
-            return False
         now = time.time()
-        self.touch_room(room_id, vault_id)
-        with self.conn:
+        with self._note_transaction(write=True):
+            self.check_legacy_note_generation(room_id, note_generation, write=True)
+            if self.conn.execute("SELECT 1 FROM bundle_receipts WHERE bundle_id = ?", (bundle_id,)).fetchone():
+                raise ApiError(409, "bundle_replay")
+            room = self.conn.execute("SELECT vault_id, retired FROM rooms WHERE room_id = ?", (room_id,)).fetchone()
+            if room and (room["vault_id"] != vault_id or room["retired"]):
+                raise ApiError(403, "room_binding_conflict")
+            current_cache = self.get_account_cache_bytes(account_id) if account_id else self.get_room_cache_bytes(room_id)
+            if current_cache + payload_len > max_cache_bytes:
+                logger.warning("Cache limit exceeded")
+                return False
+            self._touch_room(room_id, vault_id, now)
             max_row = self.conn.execute("SELECT COALESCE(MAX(sync_id), 0) AS max_id FROM bundles WHERE room_id = ?", (room_id,)).fetchone()
             sync_id = int(max_row["max_id"]) + 1
             self.conn.execute("""

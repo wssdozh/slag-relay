@@ -55,15 +55,17 @@ class StoreBase:
         return row["vault_id"] if row else None
 
     def touch_room(self, room_id: str, vault_id: Optional[str] = None) -> None:
-        now = time.time()
         with self.conn:
-            self.conn.execute("""
-                INSERT INTO rooms (room_id, created_at, last_active_at, vault_id)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(room_id) DO UPDATE SET
-                    last_active_at = excluded.last_active_at,
-                    vault_id = COALESCE(rooms.vault_id, excluded.vault_id)
-            """, (room_id, now, now, vault_id))
+            self._touch_room(room_id, vault_id, time.time())
+
+    def _touch_room(self, room_id, vault_id, now):
+        self.conn.execute("""
+            INSERT INTO rooms (room_id, created_at, last_active_at, vault_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(room_id) DO UPDATE SET
+                last_active_at = excluded.last_active_at,
+                vault_id = COALESCE(rooms.vault_id, excluded.vault_id)
+        """, (room_id, now, now, vault_id))
 
     def get_room_cache_bytes(self, room_id: str) -> int:
         row = self.conn.execute("SELECT COALESCE(SUM(LENGTH(CAST(payload AS BLOB))), 0) AS total FROM bundles WHERE room_id = ? AND expires_at > ?",
@@ -78,12 +80,16 @@ class StoreBase:
             JOIN vaults v ON v.id = r.vault_id
             WHERE v.owner_account_id = ? AND b.expires_at > ?
         """, (account_id, time.time())).fetchone()
-        return int(row["total"])
+        registry = self.conn.execute("""SELECT COALESCE(SUM(n.bytes), 0) AS total
+            FROM note_rooms n JOIN rooms r ON r.room_id = n.room_id
+            JOIN vaults v ON v.id = r.vault_id WHERE v.owner_account_id = ?""", (account_id,)).fetchone()
+        return int(row["total"]) + int(registry["total"])
 
     def cleanup_expired(self) -> None:
         now = time.time()
         with self.conn:
             self.conn.execute("DELETE FROM bundles WHERE expires_at <= ?", (now,))
+            self.cleanup_note_versions(now)
             self.conn.execute("DELETE FROM bundle_acks WHERE bundle_id NOT IN (SELECT bundle_id FROM bundles)")
             self.conn.execute("DELETE FROM pairing_sessions WHERE expires_at <= ?", (now,))
             self.conn.execute("DELETE FROM auth_challenges WHERE expires_at <= ?", (now,))

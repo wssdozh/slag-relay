@@ -21,6 +21,8 @@ from errors import ApiError
 from fmt import hash_token, iso_time
 from assistant_card import *
 from router import _NEXT
+from note_protocol import note_after, query_revision, receive_note_ops
+from store.note_registry import MAX_INT
 
 
 # A page is capped by payload bytes, not by bundle count: one bundle can carry a 6 MB
@@ -186,17 +188,36 @@ class VaultRoutes:
         if path.startswith("/api/rooms/") and len(path.strip("/").split("/")) == 4:
             parts = path.strip("/").split("/")
             room_id, action = urllib.parse.unquote(parts[2]), parts[3]
-            if action not in ("bundle", "bundles", "ack"):
+            is_note_route = action in ("note-status", "note-events", "note-heads", "note-ops")
+            if not is_note_route and action not in ("bundle", "bundles", "ack"):
                 return _NEXT
             auth = owner_account_id = vault_id = None
             max_cache = self.db.DEFAULT_MAX_CACHE_BYTES
             room_vault = self.db.room_vault(room_id)
-            if self.require_account_auth or self._bearer(headers) or room_vault:
+            if is_note_route or self.require_account_auth or self._bearer(headers) or room_vault:
                 auth = self._auth(headers)
                 vault_id = query.get("vault", "")
                 owner_account_id = self._authorize_room(auth, room_id, vault_id)
                 max_cache = PLANS[auth["plan"]]["cache_mb"] * 1024 * 1024
 
+            if is_note_route:
+                if method == "GET" and action == "note-status":
+                    return self.db.note_status(room_id), 200
+                if method == "POST" and action == "note-ops":
+                    self._authorize_vault(auth, vault_id, write=True)
+                    return await receive_note_ops(self, body, room_id, auth["device_id"], owner_account_id, max_cache), 200
+                if method == "GET" and action in ("note-events", "note-heads"):
+                    generation = query_revision(query, "generation")
+                    since = query_revision(query, "since", 0)
+                    budget = _bundle_page_budget(query.get("maxBytes"))
+                    if action == "note-events":
+                        return self.db.note_events(room_id, generation, since, budget), 200
+                    return self.db.note_heads(room_id, generation, note_after(query), since,
+                                              query_revision(query, "through", MAX_INT), budget), 200
+                return _NEXT
+
+            note_generation = query_revision(query, "noteGeneration")
+            self.db.check_legacy_note_generation(room_id, note_generation)
             if method == "POST" and action == "bundle":
                 if auth:
                     self._authorize_vault(auth, vault_id, write=True)
@@ -212,7 +233,8 @@ class VaultRoutes:
                 payload_str = json.dumps(bundle)
                 logger.info("HTTP bundle received (%d B)", len(payload_str))
                 saved = self.db.save_bundle(room_id, bundle_id, from_device, seq, timestamp, payload_str,
-                                            max_cache_bytes=max_cache, account_id=owner_account_id, vault_id=vault_id)
+                                            max_cache_bytes=max_cache, account_id=owner_account_id, vault_id=vault_id,
+                                            note_generation=note_generation)
                 if not saved:
                     return {"error": "cache_limit_exceeded"}, 413
                 sync_id = saved

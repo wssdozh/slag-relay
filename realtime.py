@@ -12,6 +12,7 @@ from typing import Optional
 from settings import *
 from errors import ApiError
 from wire import WebSocketConnection, decode_bundle_frame
+from note_protocol import query_revision, receive_note_ops
 
 
 class Realtime:
@@ -40,6 +41,8 @@ class Realtime:
                 account_id = self._authorize_room(auth, room_id, vault_id)
                 max_cache = PLANS[auth["plan"]]["cache_mb"] * 1024 * 1024
 
+            note_generation = query_revision(query, "noteGeneration")
+            self.db.check_legacy_note_generation(room_id, note_generation)
             ws_key = headers.get("sec-websocket-key", "")
             if not ws_key:
                 raise ApiError(400, "missing_sec_websocket_key")
@@ -50,6 +53,7 @@ class Realtime:
             conn = WebSocketConnection(reader, writer, room_id, device_id, account_id, max_cache)
             conn.token_hash = auth["token_hash"] if auth else None
             conn.vault_id = vault_id
+            conn.note_generation = note_generation
             self.rooms.setdefault(room_id, set()).add(conn)
             self.db.touch_room(room_id, vault_id)
             logger.info("WebSocket connected")
@@ -114,6 +118,7 @@ class Realtime:
             await conn.close()
 
     def _check_ws_auth(self, conn: WebSocketConnection, write: bool = False) -> None:
+        self.db.check_legacy_note_generation(conn.room_id, getattr(conn, 'note_generation', None), write=write)
         if conn.token_hash:
             auth = self.db.authenticate_hash(conn.token_hash)
             if not auth:
@@ -130,7 +135,7 @@ class Realtime:
             msg = json.loads(text)
             if not isinstance(msg, dict):
                 return
-            self._check_ws_auth(conn, write=msg.get("type") == "bundle")
+            self._check_ws_auth(conn, write=msg.get("type") in ("bundle", "note_ops"))
             await self._process_ws_message(conn, msg)
         except ApiError as exc:
             await conn.send_text(json.dumps({"type": "error", "code": exc.error}))
@@ -170,6 +175,13 @@ class Realtime:
                     logger.debug("ACK partial device=%s recorded=%s of=%s",
                                  conn.device_id, recorded, len(bundle_ids))
             return
+        if msg_type == "note_ops":
+            if not conn.account_id or not getattr(conn, 'note_generation', None):
+                raise ApiError(409, "note_upgrade_required")
+            result = await receive_note_ops(self, msg, conn.room_id, conn.device_id, conn.account_id,
+                                            conn.max_cache_bytes, conn.note_generation)
+            await conn.send_text(json.dumps(result, separators=(",", ":")))
+            return
         if msg_type == "bundle":
             bundle = msg.get("bundle", {})
             if not isinstance(bundle, dict):
@@ -199,7 +211,8 @@ class Realtime:
         payload_str = json.dumps(bundle)
         vault_id = self.db.room_vault(conn.room_id)
         saved = self.db.save_bundle(conn.room_id, bundle_id, from_device, seq, timestamp, payload_str,
-                                    max_cache_bytes=conn.max_cache_bytes, account_id=conn.account_id, vault_id=vault_id)
+                                    max_cache_bytes=conn.max_cache_bytes, account_id=conn.account_id, vault_id=vault_id,
+                                     note_generation=getattr(conn, 'note_generation', None))
         if not saved:
             await conn.send_text(json.dumps({"type": "error", "code": "cache_limit_exceeded"}))
             return
