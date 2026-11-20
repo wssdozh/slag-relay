@@ -854,13 +854,15 @@ class TestAccountRelay(RelayTestCase):
         path = "/api/rooms/secure/bundle?vault=vault-1"
         bundle = {"bundleId": "unique", "fromDeviceId": "device-1", "sequence": 1}
         self.assertEqual((await self.http("POST", path, bundle, owner))[0], 200)
-        self.assertEqual((await self.http("POST", "/api/rooms/other/bundle?vault=other-vault", {**bundle, "fromDeviceId": "other"}, outsider))[0], 409)
+        status, collision = await self.http("POST", "/api/rooms/other/bundle?vault=other-vault", {**bundle, "fromDeviceId": "other"}, outsider)
+        self.assertEqual((status, collision["error"]), (409, "bundle_id_conflict"))
         _, result = await self.http("POST", "/api/rooms/other/ack?vault=other-vault", {"bundleIds": ["unique"]}, outsider)
         self.assertEqual(result["acked"], 0)
         self.assertEqual((await self.http("DELETE", "/api/devices/device-2", {}, outsider))[0], 404)
         self.assertEqual((await self.http("GET", "/api/rooms/secure/bundles?vault=vault-1", token=guest))[0], 200)
         await self.http("POST", "/api/rooms/secure/ack?vault=vault-1", {"bundleIds": ["unique"]}, guest)
-        self.assertEqual((await self.http("POST", path, bundle, owner))[0], 409)
+        status, replay = await self.http("POST", path, bundle, owner)
+        self.assertEqual((status, replay["error"]), (409, "bundle_replay"))
         self.assertEqual((await self.http("PUT", "/api/vaults/vault-1", {"name": "takeover"}, outsider))[0], 403)
 
     async def test_websocket_rechecks_revocation_logout_and_rotation(self):

@@ -45,11 +45,13 @@ class BundlesMixin:
         now = time.time()
         with self._note_transaction(write=True):
             self.check_legacy_note_generation(room_id, note_generation, write=True)
-            if self.conn.execute("SELECT 1 FROM bundle_receipts WHERE bundle_id = ?", (bundle_id,)).fetchone():
-                raise ApiError(409, "bundle_replay")
             room = self.conn.execute("SELECT vault_id, retired FROM rooms WHERE room_id = ?", (room_id,)).fetchone()
             if room and (room["vault_id"] != vault_id or room["retired"]):
                 raise ApiError(403, "room_binding_conflict")
+            receipt = self.conn.execute("SELECT room_id FROM bundle_receipts WHERE bundle_id = ?", (bundle_id,)).fetchone()
+            if receipt:
+                # A legacy receipt can confirm delivery only in the room that accepted it.
+                raise ApiError(409, "bundle_replay" if receipt["room_id"] == room_id else "bundle_id_conflict")
             current_cache = self.get_account_cache_bytes(account_id) if account_id else self.get_room_cache_bytes(room_id)
             if current_cache + payload_len > max_cache_bytes:
                 logger.warning("Cache limit exceeded")
