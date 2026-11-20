@@ -80,9 +80,16 @@ def _wire(row):
 class NoteRegistryMixin:
     @contextmanager
     def _note_transaction(self, write=False):
-        with self.conn:
-            self.conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield
+        if write:
+            # The registry is not an expiring cache: acknowledge only a durable WAL commit.
+            self.conn.execute("PRAGMA synchronous=FULL")
+        try:
+            with self.conn:
+                self.conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                yield
+        finally:
+            if write:
+                self.conn.execute("PRAGMA synchronous=NORMAL")
 
     def note_status(self, room_id):
         row = self.conn.execute("SELECT mode, generation, head, floor FROM note_rooms WHERE room_id = ?",

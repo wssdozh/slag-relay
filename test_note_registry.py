@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import time
@@ -99,6 +100,32 @@ class TestNoteRegistry(test_relay.RelayTestCase):
         code, page = await self.http('GET', prefix + 'note-events' + suffix + f'&generation={self.generation}', token=guest)
         self.assertEqual((code, page['events'][0]['opId']), (200, 'new'))
         self.assertEqual((await self.http('GET', prefix + 'note-status' + suffix))[0], 401)
+
+    async def test_websocket_acceptance_delivers_sender_and_peer(self):
+        token, guest = await self.setup_room()
+        self.db.activate_note_room(ROOM, self.generation, [], self.account_id, QUOTA)
+        old_reader, old_writer, status = await self.open_ws(ROOM, OWNER, token, VAULT)
+        self.assertIn('409', status)
+        self.assertIsNone(old_writer)
+        config = {'backlog': 'http', 'noteGeneration': self.generation}
+        reader, writer, _ = await self.open_ws(ROOM, OWNER, token, VAULT, **config)
+        peer, peer_writer, _ = await self.open_ws(ROOM, 'device-2', guest, VAULT, **config)
+        async def frame(stream):
+            return await asyncio.wait_for(test_relay.read_server_ws_frame(stream), timeout=2)
+        try:
+            self.assertEqual((await frame(reader))['type'], 'welcome')
+            self.assertEqual((await frame(peer))['type'], 'welcome')
+            data = {'type': 'note_ops', 'generation': self.generation, 'requestId': 'ws', 'ops': [operation('via-ws')]}
+            writer.write(test_relay.make_client_ws_frame(json.dumps(data).encode()))
+            await writer.drain()
+            sent, received = await asyncio.gather(frame(reader), frame(peer))
+            self.assertEqual(sent, received)
+            self.assertEqual((received['type'], received['events'][0]['revision']), ('note_events', 1))
+            self.assertEqual((await frame(reader))['results'][0]['revision'], 1)
+        finally:
+            writer.close()
+            peer_writer.close()
+            await asyncio.gather(writer.wait_closed(), peer_writer.wait_closed())
 
     async def test_page_budget_allows_large_singleton(self):
         await self.setup_room()

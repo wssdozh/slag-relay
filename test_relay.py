@@ -148,8 +148,8 @@ class RelayTestCase(unittest.IsolatedAsyncioTestCase):
     async def http(self, method: str, path: str, data: dict = None, token: str = None):
         return await asyncio.to_thread(self._sync_http, method, path, data, token)
 
-    async def open_ws(self, room: str, device: str, token: str = None, vault: str = None):
-        query = {"device": device}
+    async def open_ws(self, room: str, device: str, token: str = None, vault: str = None, **params):
+        query = {"device": device, **params}
         if token is not None:
             query["token"] = token
         if vault is not None:
