@@ -101,6 +101,28 @@ class TestNoteRegistry(test_relay.RelayTestCase):
         self.assertEqual((code, page['events'][0]['opId']), (200, 'new'))
         self.assertEqual((await self.http('GET', prefix + 'note-status' + suffix))[0], 401)
 
+    async def test_cutover_fences_already_open_legacy_socket(self):
+        token, _ = await self.setup_room()
+        self.db.thaw_note_room(ROOM, self.generation)
+        reader, writer, _ = await self.open_ws(ROOM, OWNER, token, VAULT, backlog='http')
+        async def frame():
+            return await asyncio.wait_for(test_relay.read_server_ws_frame(reader), timeout=2)
+        async def push():
+            data = {'type': 'bundle', 'bundle': {'bundleId': 'open-legacy', 'fromDeviceId': OWNER}}
+            writer.write(test_relay.make_client_ws_frame(json.dumps(data).encode()))
+            await writer.drain()
+            return await frame()
+        try:
+            self.assertEqual((await frame())['type'], 'welcome')
+            generation = self.db.freeze_note_room(ROOM)
+            self.assertEqual(await push(), {'type': 'error', 'code': 'note_room_frozen'})
+            self.db.activate_note_room(ROOM, generation, [], self.account_id, QUOTA)
+            self.assertEqual(await push(), {'type': 'error', 'code': 'note_upgrade_required'})
+            self.assertEqual(self.db.get_room_watermarks(ROOM)['head'], 0)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
     async def test_websocket_acceptance_delivers_sender_and_peer(self):
         token, guest = await self.setup_room()
         self.db.activate_note_room(ROOM, self.generation, [], self.account_id, QUOTA)
