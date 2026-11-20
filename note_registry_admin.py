@@ -31,8 +31,8 @@ def main():
         elif args.action == 'thaw':
             db.thaw_note_room(args.room, args.generation)
         elif args.action == 'activate':
-            seed = json.loads(args.seed.read_text(encoding='utf-8'))
-            if seed.get('room') != args.room or not isinstance(seed.get('ops'), list):
+            seed = json.loads(args.seed.read_text(encoding='utf-8-sig'))
+            if not isinstance(seed, dict) or seed.get('room') != args.room or not isinstance(seed.get('ops'), list):
                 parser.error('invalid seed or wrong room')
             owner = db.conn.execute('''SELECT a.account_id, a.plan FROM rooms r JOIN vaults v ON v.id=r.vault_id
                 JOIN accounts a ON a.account_id=v.owner_account_id WHERE r.room_id=? AND NOT r.retired''', (args.room,)).fetchone()
