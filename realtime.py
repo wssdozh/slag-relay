@@ -42,7 +42,8 @@ class Realtime:
                 max_cache = PLANS[auth["plan"]]["cache_mb"] * 1024 * 1024
 
             note_generation = query_revision(query, "noteGeneration")
-            self.db.check_legacy_note_generation(room_id, note_generation)
+            folder_tree = query.get("folderTree") == "1"
+            self.db.check_legacy_note_generation(room_id, note_generation, folder_tree=folder_tree)
             ws_key = headers.get("sec-websocket-key", "")
             if not ws_key:
                 raise ApiError(400, "missing_sec_websocket_key")
@@ -54,6 +55,7 @@ class Realtime:
             conn.token_hash = auth["token_hash"] if auth else None
             conn.vault_id = vault_id
             conn.note_generation = note_generation
+            conn.folder_tree = folder_tree
             self.rooms.setdefault(room_id, set()).add(conn)
             self.db.touch_room(room_id, vault_id)
             logger.info("WebSocket connected")
@@ -118,7 +120,8 @@ class Realtime:
             await conn.close()
 
     def _check_ws_auth(self, conn: WebSocketConnection, write: bool = False) -> None:
-        self.db.check_legacy_note_generation(conn.room_id, getattr(conn, 'note_generation', None), write=write)
+        self.db.check_legacy_note_generation(conn.room_id, getattr(conn, 'note_generation', None), write=write,
+                                             folder_tree=getattr(conn, 'folder_tree', False))
         if conn.token_hash:
             auth = self.db.authenticate_hash(conn.token_hash)
             if not auth:
@@ -179,7 +182,8 @@ class Realtime:
             if not conn.account_id or not getattr(conn, 'note_generation', None):
                 raise ApiError(409, "note_upgrade_required")
             result = await receive_note_ops(self, msg, conn.room_id, conn.device_id, conn.account_id,
-                                            conn.max_cache_bytes, conn.note_generation)
+                                            conn.max_cache_bytes, conn.note_generation,
+                                            folder_tree=getattr(conn, 'folder_tree', False))
             await conn.send_text(json.dumps(result, separators=(",", ":")))
             return
         if msg_type == "bundle":
@@ -212,7 +216,8 @@ class Realtime:
         vault_id = self.db.room_vault(conn.room_id)
         saved = self.db.save_bundle(conn.room_id, bundle_id, from_device, seq, timestamp, payload_str,
                                     max_cache_bytes=conn.max_cache_bytes, account_id=conn.account_id, vault_id=vault_id,
-                                     note_generation=getattr(conn, 'note_generation', None))
+                                     note_generation=getattr(conn, 'note_generation', None),
+                                    folder_tree=getattr(conn, 'folder_tree', False))
         if not saved:
             await conn.send_text(json.dumps({"type": "error", "code": "cache_limit_exceeded"}))
             return

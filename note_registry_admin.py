@@ -38,7 +38,8 @@ def main():
                 JOIN accounts a ON a.account_id=v.owner_account_id WHERE r.room_id=? AND NOT r.retired''', (args.room,)).fetchone()
             if not owner:
                 parser.error('room has no active owner')
-            db.activate_note_room(args.room, seed.get('generation'), seed['ops'], owner['account_id'], PLANS[owner['plan']]['cache_mb'] * 1024 * 1024)
+            db.activate_note_room(args.room, seed.get('generation'), seed['ops'], owner['account_id'], PLANS[owner['plan']]['cache_mb'] * 1024 * 1024,
+                                  folder_tree_id=seed.get('folderTreeId'))
         print(json.dumps(db.note_status(args.room)))
     finally:
         db.conn.close()

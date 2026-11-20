@@ -123,6 +123,46 @@ class TestNoteRegistry(test_relay.RelayTestCase):
             writer.close()
             await writer.wait_closed()
 
+    async def test_tree_activation_fences_note_only_clients_and_preserves_one_head(self):
+        token, guest = await self.setup_room()
+        tree = 'b' * 64
+        with self.assertRaises(ApiError):
+            self.db.activate_note_room(ROOM, self.generation, [], self.account_id, QUOTA, folder_tree_id=tree)
+        self.assertEqual(self.db.note_status(ROOM)['mode'], 'frozen')
+        self.db.activate_note_room(ROOM, self.generation, [operation('tree', note_id=tree)],
+                                   self.account_id, QUOTA, folder_tree_id=tree)
+        url = f'/api/rooms/{ROOM}/'
+        query = f'?vault={VAULT}&generation={self.generation}&noteGeneration={self.generation}'
+        batch = {'generation': self.generation, 'requestId': 'tree', 'ops': [operation('update', 'update', 1, tree)]}
+        for method, route, body in [('GET', 'note-status', None), ('GET', 'note-heads', None),
+                                    ('GET', 'note-events', None), ('GET', 'bundles', None),
+                                    ('POST', 'note-ops', batch), ('POST', 'bundle', {'fromDeviceId': OWNER})]:
+            code, result = await self.http(method, url + route + query, body, token)
+            self.assertEqual((code, result['error']), (409, 'note_upgrade_required'), route)
+        _, old, status = await self.open_ws(ROOM, OWNER, token, VAULT, noteGeneration=self.generation)
+        self.assertIn('409', status)
+        self.assertIsNone(old)
+        config = {'backlog': 'http', 'noteGeneration': self.generation, 'folderTree': 1}
+        reader, writer, _ = await self.open_ws(ROOM, 'device-2', guest, VAULT, **config)
+        try:
+            async def frame():
+                return await asyncio.wait_for(test_relay.read_server_ws_frame(reader), timeout=2)
+            self.assertEqual((await frame())['type'], 'welcome')
+            query += '&folderTree=1'
+            self.assertTrue((await self.http('GET', url + 'note-status' + query, token=token))[1]['folderTree'])
+            code, result = await self.http('POST', url + 'note-ops' + query, batch, token)
+            self.assertEqual((code, result['results'][0]['revision']), (200, 2))
+            self.assertEqual((await frame())['events'][0]['noteId'], tree)
+            self.assertEqual((await self.http('POST', url + 'note-ops' + query, batch, token))[1], result)
+            batch['ops'] = [operation('delete-tree', 'delete', 2, tree)]
+            _, refused = await self.http('POST', url + 'note-ops' + query, batch, token)
+            self.assertEqual(refused['results'][0]['code'], 'invalid_folder_tree_transition')
+            _, head = await self.http('GET', url + 'note-heads' + query, token=token)
+            self.assertEqual([(row['noteId'], row['revision']) for row in head['heads']], [(tree, 2)])
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
     async def test_websocket_acceptance_delivers_sender_and_peer(self):
         token, guest = await self.setup_room()
         self.db.activate_note_room(ROOM, self.generation, [], self.account_id, QUOTA)
@@ -148,6 +188,67 @@ class TestNoteRegistry(test_relay.RelayTestCase):
             writer.close()
             peer_writer.close()
             await asyncio.gather(writer.wait_closed(), peer_writer.wait_closed())
+
+    async def test_stress_disconnects_duplicate_receipts_and_conflicting_folder_updates(self):
+        token, guest = await self.setup_room()
+        tree = 'b' * 64
+        self.db.activate_note_room(ROOM, self.generation, [operation('tree', note_id=tree)],
+                                   self.account_id, QUOTA, folder_tree_id=tree)
+        query = f'?vault={VAULT}&generation={self.generation}&folderTree=1'
+        url = f'/api/rooms/{ROOM}/'
+        revision = 1
+        count = 0
+        for cycle in range(12):
+            reader, writer, status = await self.open_ws(ROOM, OWNER, token, VAULT, backlog='http',
+                                                        noteGeneration=self.generation, folderTree=1)
+            self.assertIn('101', status)
+            try:
+                self.assertEqual((await test_relay.read_server_ws_frame(reader))['type'], 'welcome')
+                start = revision
+                ops = [operation(f'tree-{cycle}', 'update', start, tree)]
+                ops.extend(operation(f'task-{cycle}-{i}', note_id=f'{1000 + count + i:064x}') for i in range(24))
+                batch = {'type': 'note_ops', 'generation': self.generation, 'requestId': f'cycle-{cycle}', 'ops': ops}
+                writer.write(test_relay.make_client_ws_frame(json.dumps(batch).encode()))
+                await writer.drain()
+                # The write reached SQLite, but disconnect without consuming the result frame.
+                event = await asyncio.wait_for(test_relay.read_server_ws_frame(reader), timeout=3)
+                self.assertEqual(event['type'], 'note_events')
+                self.assertEqual(len(event['events']), len(ops))
+            finally:
+                writer.close()
+                await writer.wait_closed()
+            count += 24
+            revision = 2 + 25 * cycle
+            stale = {'generation': self.generation, 'requestId': f'guest-{cycle}',
+                     'ops': [operation(f'offline-{cycle}', 'update', start, tree)]}
+            (code, (retry_code, receipt)), (guest_code, conflict) = await asyncio.gather(
+                self._repeat_batch(url + 'note-ops' + query, batch, token),
+                self.http('POST', url + 'note-ops' + query, stale, guest),
+            )
+            self.assertEqual((code, retry_code, guest_code), (200, 200, 200))
+            self.assertEqual([row['revision'] for row in receipt['results']], list(range(revision, revision + 25)))
+            self.assertEqual(conflict['results'][0]['status'], 'stale')
+            self.assertEqual(conflict['results'][0]['current']['revision'], revision)
+            # Global sequence includes the independent task heads; the tree base does not.
+            self.assertEqual(self.db.note_status(ROOM)['head'], 1 + count + cycle + 1)
+            # The next tree must use its own head, not the global high water mark.
+        cursor = 0
+        delivered = []
+        while cursor < self.db.note_status(ROOM)['head']:
+            code, page = await self.http('GET', url + 'note-events' + query + f'&since={cursor}', token=guest)
+            self.assertEqual(code, 200)
+            self.assertTrue(page['events'])
+            delivered.extend(page['events'])
+            cursor = delivered[-1]['revision']
+        self.assertEqual(len(delivered), 300)
+        self.assertEqual(len({row['opId'] for row in delivered}), 300)
+        self.assertEqual([row['revision'] for row in delivered], list(range(2, 302)))
+
+    async def _repeat_batch(self, url, batch, token):
+        code, first = await self.http('POST', url, batch, token)
+        retry_code, second = await self.http('POST', url, batch, token)
+        self.assertEqual(first, second)
+        return code, (retry_code, second)
 
     async def test_page_budget_allows_large_singleton(self):
         await self.setup_room()

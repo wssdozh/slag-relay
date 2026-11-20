@@ -38,13 +38,14 @@ class BundlesMixin:
     def save_bundle(self, room_id: str, bundle_id: str, from_device: str, seq: int, ts: str,
                     payload_json: str, ttl: int = DEFAULT_TTL_SECONDS,
                     max_cache_bytes: int = MAX_CACHE_BYTES, account_id: Optional[str] = None,
-                    vault_id: Optional[str] = None, note_generation: Optional[int] = None) -> int | bool:
+                    vault_id: Optional[str] = None, note_generation: Optional[int] = None,
+                    folder_tree: bool = False) -> int | bool:
         if not isinstance(bundle_id, str) or not bundle_id or len(bundle_id) > 256:
             raise ApiError(400, "invalid_bundle_id")
         payload_len = len(payload_json.encode("utf-8"))
         now = time.time()
         with self._note_transaction(write=True):
-            self.check_legacy_note_generation(room_id, note_generation, write=True)
+            self.check_legacy_note_generation(room_id, note_generation, write=True, folder_tree=folder_tree)
             room = self.conn.execute("SELECT vault_id, retired FROM rooms WHERE room_id = ?", (room_id,)).fetchone()
             if room and (room["vault_id"] != vault_id or room["retired"]):
                 raise ApiError(403, "room_binding_conflict")

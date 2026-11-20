@@ -35,17 +35,19 @@ async def _deliver(client, text):
         client.writer.close()
 
 
-async def receive_note_ops(server, body, room_id, device_id, owner_account_id, quota, session_generation=None):
+async def receive_note_ops(server, body, room_id, device_id, owner_account_id, quota, session_generation=None, *, folder_tree=False):
     request_id, generation = body.get("requestId"), body.get("generation")
     if not _valid_id(request_id, OP_ID) or not _valid_int(generation, 1):
         raise ApiError(400, "invalid_note_request")
     if session_generation is not None and session_generation != generation:
         raise ApiError(409, "note_upgrade_required")
-    results, events = server.db.commit_note_ops(room_id, generation, device_id, owner_account_id, quota, body.get("ops"))
+    results, events = server.db.commit_note_ops(room_id, generation, device_id, owner_account_id, quota, body.get("ops"), folder_tree=folder_tree)
     if events:
         message = {"type": "note_events", "generation": generation, "events": events}
         text = json.dumps(message, separators=(",", ":"))
         clients = tuple(server.rooms.get(room_id, ()))
+        current = server.db.note_status(room_id)
         await asyncio.gather(*(_deliver(client, text) for client in clients
-                               if getattr(client, 'note_generation', None) == generation))
+                               if getattr(client, 'note_generation', None) == generation
+                               and (not current.get('folderTree') or getattr(client, 'folder_tree', False))))
     return {"type": "note_results", "requestId": request_id, "generation": generation, "results": results}

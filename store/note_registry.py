@@ -92,19 +92,31 @@ class NoteRegistryMixin:
                 self.conn.execute("PRAGMA synchronous=NORMAL")
 
     def note_status(self, room_id):
-        row = self.conn.execute("SELECT mode, generation, head, floor FROM note_rooms WHERE room_id = ?",
-                                (room_id,)).fetchone()
-        return dict(row) if row else {"mode": "legacy", "generation": 0, "head": 0, "floor": 0}
+        row = self.conn.execute("""SELECT n.mode, n.generation, n.head, n.floor, t.note_id AS folder_tree_id
+            FROM note_rooms n LEFT JOIN note_folder_trees t USING (room_id) WHERE n.room_id = ?""", (room_id,)).fetchone()
+        if not row:
+            return {"mode": "legacy", "generation": 0, "head": 0, "floor": 0}
+        status = dict(row)
+        if status.pop("folder_tree_id") is not None:
+            status["folderTree"] = True
+        return status
 
-    def check_legacy_note_generation(self, room_id, generation, *, write=False):
+    @staticmethod
+    def require_folder_tree_support(status, folder_tree):
+        if status.get("folderTree") and not folder_tree:
+            raise ApiError(409, "note_upgrade_required")
+
+    def check_legacy_note_generation(self, room_id, generation, *, write=False, folder_tree=False):
         status = self.note_status(room_id)
+        self.require_folder_tree_support(status, folder_tree)
         if status["mode"] == "frozen" and write:
             raise ApiError(409, "note_room_frozen")
         if status["mode"] == "registry" and generation != status["generation"]:
             raise ApiError(409, "note_upgrade_required")
 
-    def _require_note_registry(self, room_id, generation):
+    def _require_note_registry(self, room_id, generation, folder_tree=False):
         status = self.note_status(room_id)
+        self.require_folder_tree_support(status, folder_tree)
         if status["mode"] == "frozen":
             raise ApiError(409, "note_room_frozen")
         if status["mode"] != "registry" or status["generation"] != generation:
@@ -133,7 +145,7 @@ class NoteRegistryMixin:
                 raise ApiError(409, "note_prepare_changed")
             self.conn.execute("UPDATE note_rooms SET mode = 'legacy' WHERE room_id = ?", (room_id,))
 
-    def activate_note_room(self, room_id, generation, ops, owner_account_id, max_cache_bytes):
+    def activate_note_room(self, room_id, generation, ops, owner_account_id, max_cache_bytes, folder_tree_id=None):
         """Local operator entry. Ciphertexts are prepared for this exact generation."""
         with self._note_transaction(write=True):
             status = self.note_status(room_id)
@@ -148,11 +160,15 @@ class NoteRegistryMixin:
             ids = set()
             seen_ops = set()
             bootstrap_bytes = 0
+            if folder_tree_id is not None and not _valid_id(folder_tree_id, NOTE_ID):
+                raise ApiError(400, "invalid_folder_tree_id")
             for raw in ops:
                 op, digest, length = validate_note_ops([raw])[0]
                 if (op["baseRevision"] != 0 or op["kind"] not in ("create", "delete")
                         or op["noteId"] in ids or op["opId"] in seen_ops):
                     raise ApiError(400, "invalid_note_seed")
+                if op["noteId"] == folder_tree_id and op["kind"] != "create":
+                    raise ApiError(400, "invalid_folder_tree_seed")
                 ids.add(op["noteId"])
                 seen_ops.add(op["opId"])
                 bootstrap_bytes += length + RECEIPT_BYTES
@@ -160,6 +176,10 @@ class NoteRegistryMixin:
                     raise ApiError(413, "cache_limit_exceeded")
                 revision += 1
                 self._store_note_version(room_id, revision, "bootstrap", op, digest, length)
+            if folder_tree_id is not None:
+                if folder_tree_id not in ids:
+                    raise ApiError(400, "missing_folder_tree_seed")
+                self.conn.execute("INSERT INTO note_folder_trees VALUES (?, ?)", (room_id, folder_tree_id))
             # Initial state is obtained by scanning heads; it is not duplicated into an old feed.
             self.conn.execute("""UPDATE note_rooms SET mode = 'registry', head = ?, floor = ?, bytes = ?
                 WHERE room_id = ?""", (revision, revision, bootstrap_bytes, room_id))
@@ -174,11 +194,12 @@ class NoteRegistryMixin:
         self.conn.execute("INSERT INTO note_receipts VALUES (?, ?, ?, ?, ?)",
                           (room_id, op["opId"], sender_id, digest, revision))
 
-    def commit_note_ops(self, room_id, generation, sender_id, owner_account_id, max_cache_bytes, ops):
+    def commit_note_ops(self, room_id, generation, sender_id, owner_account_id, max_cache_bytes, ops, *, folder_tree=False):
         validated = validate_note_ops(ops)
         results, events = [], []
         with self._note_transaction(write=True):
-            status = self._require_note_registry(room_id, generation)
+            status = self._require_note_registry(room_id, generation, folder_tree)
+            tree_id = self.conn.execute("SELECT note_id FROM note_folder_trees WHERE room_id = ?", (room_id,)).fetchone()
             head = status["head"]
             used = self.get_account_cache_bytes(owner_account_id)
             written_bytes = 0
@@ -196,7 +217,9 @@ class NoteRegistryMixin:
                         WHERE h.room_id = ? AND h.note_id = ?""", (room_id, note_id)).fetchone()
                     revision = current["revision"] if current else 0
                     kind = op["kind"]
-                    if revision != op["baseRevision"]:
+                    if tree_id and note_id == tree_id["note_id"] and kind != "update":
+                        result = {"status": "rejected", "code": "invalid_folder_tree_transition"}
+                    elif revision != op["baseRevision"]:
                         result = {"status": "stale", "current": self._note_version(room_id, revision) if current else None}
                     elif ((kind == "create" and not current)
                           or (kind == "restore" and current and current["kind"] == "delete")
@@ -233,18 +256,18 @@ class NoteRegistryMixin:
             page.append(self._note_version(room_id, row["revision"]))
         return page, False
 
-    def note_events(self, room_id, generation, since, budget):
+    def note_events(self, room_id, generation, since, budget, *, folder_tree=False):
         with self._note_transaction():
-            status = self._require_note_registry(room_id, generation)
+            status = self._require_note_registry(room_id, generation, folder_tree)
             candidates = self.conn.execute("""SELECT revision, bytes FROM note_versions
                 WHERE room_id = ? AND revision > ? ORDER BY revision LIMIT ?""",
                 (room_id, max(since, status["floor"]), PAGE_COUNT + 1)).fetchall()
             events, _ = self._note_page(room_id, candidates, budget)
             return {"generation": generation, "head": status["head"], "floor": status["floor"], "events": events}
 
-    def note_heads(self, room_id, generation, after, since, through, budget):
+    def note_heads(self, room_id, generation, after, since, through, budget, *, folder_tree=False):
         with self._note_transaction():
-            status = self._require_note_registry(room_id, generation)
+            status = self._require_note_registry(room_id, generation, folder_tree)
             candidates = self.conn.execute("""SELECT v.revision, v.bytes FROM note_heads h
                 JOIN note_versions v ON v.room_id = h.room_id AND v.revision = h.revision
                 WHERE h.room_id = ? AND h.note_id > ? AND h.revision > ? AND h.revision <= ?

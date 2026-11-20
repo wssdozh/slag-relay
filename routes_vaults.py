@@ -200,24 +200,27 @@ class VaultRoutes:
                 owner_account_id = self._authorize_room(auth, room_id, vault_id)
                 max_cache = PLANS[auth["plan"]]["cache_mb"] * 1024 * 1024
 
+            folder_tree = query.get("folderTree") == "1"
             if is_note_route:
                 if method == "GET" and action == "note-status":
-                    return self.db.note_status(room_id), 200
+                    status = self.db.note_status(room_id)
+                    self.db.require_folder_tree_support(status, folder_tree)
+                    return status, 200
                 if method == "POST" and action == "note-ops":
                     self._authorize_vault(auth, vault_id, write=True)
-                    return await receive_note_ops(self, body, room_id, auth["device_id"], owner_account_id, max_cache), 200
+                    return await receive_note_ops(self, body, room_id, auth["device_id"], owner_account_id, max_cache, folder_tree=folder_tree), 200
                 if method == "GET" and action in ("note-events", "note-heads"):
                     generation = query_revision(query, "generation")
                     since = query_revision(query, "since", 0)
                     budget = _bundle_page_budget(query.get("maxBytes"))
                     if action == "note-events":
-                        return self.db.note_events(room_id, generation, since, budget), 200
+                        return self.db.note_events(room_id, generation, since, budget, folder_tree=folder_tree), 200
                     return self.db.note_heads(room_id, generation, note_after(query), since,
-                                              query_revision(query, "through", MAX_INT), budget), 200
+                                              query_revision(query, "through", MAX_INT), budget, folder_tree=folder_tree), 200
                 return _NEXT
 
             note_generation = query_revision(query, "noteGeneration")
-            self.db.check_legacy_note_generation(room_id, note_generation)
+            self.db.check_legacy_note_generation(room_id, note_generation, folder_tree=folder_tree)
             if method == "POST" and action == "bundle":
                 if auth:
                     self._authorize_vault(auth, vault_id, write=True)
@@ -234,7 +237,7 @@ class VaultRoutes:
                 logger.info("HTTP bundle received (%d B)", len(payload_str))
                 saved = self.db.save_bundle(room_id, bundle_id, from_device, seq, timestamp, payload_str,
                                             max_cache_bytes=max_cache, account_id=owner_account_id, vault_id=vault_id,
-                                            note_generation=note_generation)
+                                            note_generation=note_generation, folder_tree=folder_tree)
                 if not saved:
                     return {"error": "cache_limit_exceeded"}, 413
                 sync_id = saved

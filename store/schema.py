@@ -321,4 +321,8 @@ def apply_schema(conn: sqlite3.Connection) -> None:
                 revision INTEGER NOT NULL,
                 PRIMARY KEY (room_id, op_id)
             );
+            CREATE TABLE IF NOT EXISTS note_folder_trees (
+                room_id TEXT PRIMARY KEY,
+                note_id TEXT NOT NULL
+            );
         """)
