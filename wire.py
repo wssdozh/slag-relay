@@ -94,30 +94,54 @@ class WebSocketConnection:
                 self.closed = True
 
     async def read_frame(self) -> Optional[Tuple[int, bytes]]:
+        # The browser may split one send() across data frames. Dispatch only the completed
+        # message and keep the original byte limit across all of its continuation frames.
+        message_opcode = None
+        message = bytearray()
         try:
-            first_two = await self.reader.readexactly(2)
-            byte1, byte2 = first_two[0], first_two[1]
-            opcode = byte1 & 0x0F
-            masked = (byte2 & 0x80) != 0
-            length = byte2 & 0x7F
-            if length == 126:
-                length = struct.unpack("!H", await self.reader.readexactly(2))[0]
-            elif length == 127:
-                length = struct.unpack("!Q", await self.reader.readexactly(8))[0]
-            if length > 16 * 1024 * 1024 or not masked or not (byte1 & 0x80):
-                return None
-            mask = await self.reader.readexactly(4) if masked else None
-            payload = bytearray(await self.reader.readexactly(length)) if length else bytearray()
-            if masked and mask:
-                for i in range(len(payload)):
+            while True:
+                byte1, byte2 = await self.reader.readexactly(2)
+                opcode = byte1 & 0x0F
+                final = bool(byte1 & 0x80)
+                length = byte2 & 0x7F
+                if byte1 & 0x70 or not byte2 & 0x80 or opcode not in (0, 1, 2, 8, 9, 10):
+                    return None
+                control = opcode >= 8
+                if control:
+                    if not final or length > 125 or (opcode == 8 and length == 1):
+                        return None
+                else:
+                    if (opcode == 0) != (message_opcode is not None):
+                        return None
+                    if length == 126:
+                        length = struct.unpack("!H", await self.reader.readexactly(2))[0]
+                        if length < 126:
+                            return None
+                    elif length == 127:
+                        length = struct.unpack("!Q", await self.reader.readexactly(8))[0]
+                        if length <= 65535:
+                            return None
+                    if len(message) + length > 16 * 1024 * 1024:
+                        return None
+                mask = await self.reader.readexactly(4)
+                payload = bytearray(await self.reader.readexactly(length))
+                for i in range(length):
                     payload[i] ^= mask[i % 4]
-            if opcode == 0x8:
-                return opcode, b""
-            if opcode == 0x9:
-                # Same lock as the backlog dump: a pong must not land inside a bundle frame.
-                await self.send_raw(bytes([0x8A, len(payload)]) + payload)
-                return await self.read_frame()
-            return opcode, bytes(payload)
+                if opcode == 8:
+                    return opcode, b""
+                if opcode == 9:
+                    # Same lock as the backlog dump: a pong cannot interleave with a message.
+                    await self.send_raw(bytes([0x8A, length]) + payload)
+                if control:
+                    self.last_frame_at = time.monotonic()
+                    continue
+                if message_opcode is None and final:
+                    return opcode, bytes(payload)
+                if message_opcode is None:
+                    message_opcode = opcode
+                message.extend(payload)
+                if final:
+                    return message_opcode, bytes(message)
         except (asyncio.IncompleteReadError, ConnectionResetError):
             return None
 

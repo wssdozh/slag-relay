@@ -26,10 +26,10 @@ BUNDLE_COUNT = 100
 PAYLOAD_BYTES = 40_000
 
 
-def ws_frame(payload: bytes, opcode: int = 0x1) -> bytes:
+def ws_frame(payload: bytes, opcode: int = 0x1, *, final: bool = True) -> bytes:
     mask = os.urandom(4)
     masked = bytearray(value ^ mask[i % 4] for i, value in enumerate(payload))
-    first = 0x80 | opcode
+    first = (0x80 if final else 0) | opcode
     length = len(payload)
     if length <= 125:
         header = bytearray([first, 0x80 | length]) + mask
@@ -117,6 +117,23 @@ class BacklogAckTest(unittest.IsolatedAsyncioTestCase):
             writer.write(ws_frame(json.dumps({"type": "ping"}).encode()))
             await writer.drain()
             self.assertEqual((await asyncio.wait_for(read_frame(reader), timeout=5))["type"], "pong")
+        finally:
+            writer.close()
+
+    async def test_fragmented_message_with_interleaved_control_frames(self):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        try:
+            await open_ws(reader, writer, f"/ws/{ROOM}?device={ME}&vault={VAULT}&backlog=http")
+            self.assertEqual((await read_frame(reader))["type"], "welcome")
+            payload = json.dumps({"type": "ping", "padding": "a" * 85000}).encode()
+            writer.write(ws_frame(payload[:32000], final=False) + ws_frame(b"ok", 9))
+            await writer.drain()
+            self.assertEqual(await asyncio.wait_for(reader.readexactly(4), 5), b"\x8a\x02ok")
+            writer.write(ws_frame(payload[32000:64000], 0, final=False) + ws_frame(b"ok", 10) +
+                         ws_frame(payload[64000:], 0) + ws_frame(b'{"type":"ping"}'))
+            await writer.drain()
+            for _ in range(2):
+                self.assertEqual((await asyncio.wait_for(read_frame(reader), 5))["type"], "pong")
         finally:
             writer.close()
 
