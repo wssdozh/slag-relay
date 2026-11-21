@@ -293,6 +293,13 @@ def apply_schema(conn: sqlite3.Connection) -> None:
                 floor INTEGER NOT NULL DEFAULT 0,
                 bytes INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS note_media (
+                room_id TEXT NOT NULL REFERENCES note_rooms(room_id) ON DELETE CASCADE,
+                generation INTEGER NOT NULL,
+                blob_id TEXT NOT NULL,
+                body BLOB NOT NULL,
+                PRIMARY KEY (room_id, generation, blob_id)
+            );
             CREATE TABLE IF NOT EXISTS note_versions (
                 room_id TEXT NOT NULL,
                 revision INTEGER NOT NULL,
@@ -326,3 +333,11 @@ def apply_schema(conn: sqlite3.Connection) -> None:
                 note_id TEXT NOT NULL
             );
         """)
+        ensure_column(conn, "note_media", "orphaned_at", "REAL")
+        ensure_column(conn, "note_versions", "media_ids", "TEXT")
+        ensure_column(conn, "note_versions", "group_id", "TEXT")
+        ensure_column(conn, "note_versions", "group_index", "INTEGER")
+        ensure_column(conn, "note_versions", "group_size", "INTEGER")
+        ensure_column(conn, "note_folder_trees", "atomic_groups", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "note_rooms", "shared_records", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "note_rooms", "registry_media", "INTEGER NOT NULL DEFAULT 0")

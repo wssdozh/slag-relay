@@ -22,7 +22,7 @@ LEVELS = {
     "premium": 0,
     "store": 1, "store.base": 1, "store.schema": 1, "store.bundles": 1, "store.accounts": 1,
     "store.pairing": 1, "store.vaults": 1, "store.notify": 1, "store.assistant": 1,
-    "store.note_registry": 1,
+    "store.note_registry": 1, "store.note_media": 1,
     "router": 2, "http_plumbing": 2, "realtime": 2, "note_protocol": 2, "note_registry_admin": 2,
     "routes_health": 2, "routes_public": 2, "routes_admin": 2, "routes_admin_ops": 2, "routes_auth": 2,
     "routes_notify": 2, "routes_vaults": 2, "routes_manifest": 2, "routes_ai": 2, "routes_static": 2,

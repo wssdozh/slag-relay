@@ -22,6 +22,7 @@ from fmt import hash_token, iso_time
 from assistant_card import *
 from router import _NEXT
 from note_protocol import note_after, query_revision, receive_note_ops
+from store.note_media import MEDIA_MAX_BYTES
 from store.note_registry import MAX_INT
 
 
@@ -188,7 +189,7 @@ class VaultRoutes:
         if path.startswith("/api/rooms/") and len(path.strip("/").split("/")) == 4:
             parts = path.strip("/").split("/")
             room_id, action = urllib.parse.unquote(parts[2]), parts[3]
-            is_note_route = action in ("note-status", "note-events", "note-heads", "note-ops")
+            is_note_route = action in ("note-status", "note-events", "note-heads", "note-ops", "note-media")
             if not is_note_route and action not in ("bundle", "bundles", "ack"):
                 return _NEXT
             auth = owner_account_id = vault_id = None
@@ -201,26 +202,49 @@ class VaultRoutes:
                 max_cache = PLANS[auth["plan"]]["cache_mb"] * 1024 * 1024
 
             folder_tree = query.get("folderTree") == "1"
+            groups = query.get("atomicGroups") == "1"
+            shared = query.get("sharedRecords") == "1"
+            media = query.get("registryMedia") == "1"
             if is_note_route:
+                if action == "note-media" and method in ("GET", "PUT"):
+                    status = self.db.note_status(room_id)
+                    self.db.require_folder_tree_support(status, folder_tree, groups, shared, media)
+                    generation = query_revision(query, "generation")
+                    blob_id = query.get("id", "")
+                    if method == "GET":
+                        ciphertext = self.db.get_note_media(room_id, generation, blob_id)
+                        return {"ciphertext": base64.b64encode(ciphertext).decode("ascii")}, 200
+                    self._authorize_vault(auth, vault_id, write=True)
+                    encoded = body.get("ciphertext")
+                    if not isinstance(encoded, str):
+                        raise ApiError(400, "invalid_note_media")
+                    if len(encoded) > 4 * ((MEDIA_MAX_BYTES + 2) // 3):
+                        raise ApiError(413, "note_media_too_large")
+                    try:
+                        ciphertext = base64.b64decode(encoded, validate=True)
+                    except ValueError:
+                        raise ApiError(400, "invalid_note_media") from None
+                    self.db.put_note_media(room_id, generation, blob_id, ciphertext, owner_account_id, max_cache)
+                    return {"id": blob_id}, 200
                 if method == "GET" and action == "note-status":
                     status = self.db.note_status(room_id)
-                    self.db.require_folder_tree_support(status, folder_tree)
+                    self.db.require_folder_tree_support(status, folder_tree, groups, shared, media)
                     return status, 200
                 if method == "POST" and action == "note-ops":
                     self._authorize_vault(auth, vault_id, write=True)
-                    return await receive_note_ops(self, body, room_id, auth["device_id"], owner_account_id, max_cache, folder_tree=folder_tree), 200
+                    return await receive_note_ops(self, body, room_id, auth["device_id"], owner_account_id, max_cache, folder_tree=folder_tree, groups=groups, shared=shared, media=media), 200
                 if method == "GET" and action in ("note-events", "note-heads"):
                     generation = query_revision(query, "generation")
                     since = query_revision(query, "since", 0)
                     budget = _bundle_page_budget(query.get("maxBytes"))
                     if action == "note-events":
-                        return self.db.note_events(room_id, generation, since, budget, folder_tree=folder_tree), 200
+                        return self.db.note_events(room_id, generation, since, budget, folder_tree=folder_tree, groups=groups, shared=shared, media=media), 200
                     return self.db.note_heads(room_id, generation, note_after(query), since,
-                                              query_revision(query, "through", MAX_INT), budget, folder_tree=folder_tree), 200
+                                              query_revision(query, "through", MAX_INT), budget, folder_tree=folder_tree, groups=groups, shared=shared, media=media), 200
                 return _NEXT
 
             note_generation = query_revision(query, "noteGeneration")
-            self.db.check_legacy_note_generation(room_id, note_generation, folder_tree=folder_tree)
+            self.db.check_legacy_note_generation(room_id, note_generation, folder_tree=folder_tree, groups=groups, shared=shared, media=media)
             if method == "POST" and action == "bundle":
                 if auth:
                     self._authorize_vault(auth, vault_id, write=True)
@@ -237,7 +261,7 @@ class VaultRoutes:
                 logger.info("HTTP bundle received (%d B)", len(payload_str))
                 saved = self.db.save_bundle(room_id, bundle_id, from_device, seq, timestamp, payload_str,
                                             max_cache_bytes=max_cache, account_id=owner_account_id, vault_id=vault_id,
-                                            note_generation=note_generation, folder_tree=folder_tree)
+                                            note_generation=note_generation, folder_tree=folder_tree, groups=groups, shared=shared, media=media)
                 if not saved:
                     return {"error": "cache_limit_exceeded"}, 413
                 sync_id = saved

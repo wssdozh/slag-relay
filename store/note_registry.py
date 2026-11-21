@@ -10,6 +10,7 @@ import time
 
 from errors import ApiError
 from settings import DEFAULT_TTL_SECONDS
+from store.note_media import NoteMediaMixin
 
 PAGE_COUNT = 100
 PAGE_BYTES = 2_000_000
@@ -63,21 +64,45 @@ def validate_note_ops(ops):
             raise ApiError(400, "invalid_note_seal")
         op = {"opId": op_id, "noteId": note_id, "baseRevision": base, "kind": kind,
               "sealed": {"iv": iv, "ciphertext": ciphertext}}
+        if "group" in raw:
+            group = raw["group"]
+            if (not isinstance(group, dict) or not _valid_id(group.get("id"), OP_ID)
+                    or not _valid_int(group.get("index")) or not _valid_int(group.get("size"), 2)
+                    or group["size"] != len(ops) or group["index"] != len(validated)):
+                raise ApiError(400, "invalid_note_group")
+            op["group"] = {"id": group["id"], "index": group["index"], "size": group["size"]}
+        if "mediaIds" in raw:
+            ids = raw["mediaIds"]
+            if (not isinstance(ids, list) or not 0 < len(ids) <= PAGE_COUNT or kind == "delete"
+                    or any(not _valid_id(blob_id, NOTE_ID) for blob_id in ids) or ids != sorted(set(ids))):
+                raise ApiError(400, "invalid_note_media_refs")
+            op["mediaIds"] = ids
         body = json.dumps(op, separators=(",", ":")).encode("ascii")
         size += len(body)
         if len(ops) > 1 and size > PAGE_BYTES:
             raise ApiError(413, "note_batch_too_large")
         validated.append((op, hashlib.sha256(body).digest(), len(body) + VERSION_OVERHEAD))
+    if any("group" in op for op, _, _ in validated):
+        first = validated[0][0].get("group")
+        if (first is None or first["id"] != validated[0][0]["opId"]
+                or any(op.get("group", {}).get("id") != first["id"] for op, _, _ in validated)
+                or len({op["noteId"] for op, _, _ in validated}) != len(validated)):
+            raise ApiError(400, "invalid_note_group")
     return validated
 
 
 def _wire(row):
-    return {"opId": row["op_id"], "noteId": row["note_id"], "baseRevision": row["base_revision"],
-            "kind": row["kind"], "revision": row["revision"],
-            "sealed": {"iv": row["iv"], "ciphertext": row["ciphertext"]}}
+    op = {"opId": row["op_id"], "noteId": row["note_id"], "baseRevision": row["base_revision"],
+          "kind": row["kind"], "revision": row["revision"],
+          "sealed": {"iv": row["iv"], "ciphertext": row["ciphertext"]}}
+    if row["group_id"] is not None:
+        op["group"] = {"id": row["group_id"], "index": row["group_index"], "size": row["group_size"]}
+    if row["media_ids"] is not None:
+        op["mediaIds"] = json.loads(row["media_ids"])
+    return op
 
 
-class NoteRegistryMixin:
+class NoteRegistryMixin(NoteMediaMixin):
     @contextmanager
     def _note_transaction(self, write=False):
         if write:
@@ -92,31 +117,41 @@ class NoteRegistryMixin:
                 self.conn.execute("PRAGMA synchronous=NORMAL")
 
     def note_status(self, room_id):
-        row = self.conn.execute("""SELECT n.mode, n.generation, n.head, n.floor, t.note_id AS folder_tree_id
+        row = self.conn.execute("""SELECT n.mode, n.generation, n.head, n.floor, n.shared_records, n.registry_media, t.note_id AS folder_tree_id, t.atomic_groups
             FROM note_rooms n LEFT JOIN note_folder_trees t USING (room_id) WHERE n.room_id = ?""", (room_id,)).fetchone()
         if not row:
             return {"mode": "legacy", "generation": 0, "head": 0, "floor": 0}
         status = dict(row)
         if status.pop("folder_tree_id") is not None:
             status["folderTree"] = True
+        if status.pop("atomic_groups"):
+            status["atomicGroups"] = True
+        if status.pop("shared_records"):
+            status["sharedRecords"] = True
+        if status.pop("registry_media"):
+            status["registryMedia"] = True
         return status
 
     @staticmethod
-    def require_folder_tree_support(status, folder_tree):
-        if status.get("folderTree") and not folder_tree:
+    def supports_note_room(status, folder_tree, groups=False, shared=False, media=False):
+        return (not status.get("folderTree") or folder_tree) and (not status.get("atomicGroups") or groups) \
+            and (not status.get("sharedRecords") or shared) and (not status.get("registryMedia") or media)
+
+    def require_folder_tree_support(self, status, folder_tree, groups=False, shared=False, media=False):
+        if not self.supports_note_room(status, folder_tree, groups, shared, media):
             raise ApiError(409, "note_upgrade_required")
 
-    def check_legacy_note_generation(self, room_id, generation, *, write=False, folder_tree=False):
+    def check_legacy_note_generation(self, room_id, generation, *, write=False, folder_tree=False, groups=False, shared=False, media=False):
         status = self.note_status(room_id)
-        self.require_folder_tree_support(status, folder_tree)
+        self.require_folder_tree_support(status, folder_tree, groups, shared, media)
         if status["mode"] == "frozen" and write:
             raise ApiError(409, "note_room_frozen")
         if status["mode"] == "registry" and generation != status["generation"]:
             raise ApiError(409, "note_upgrade_required")
 
-    def _require_note_registry(self, room_id, generation, folder_tree=False):
+    def _require_note_registry(self, room_id, generation, folder_tree=False, groups=False, shared=False, media=False):
         status = self.note_status(room_id)
-        self.require_folder_tree_support(status, folder_tree)
+        self.require_folder_tree_support(status, folder_tree, groups, shared, media)
         if status["mode"] == "frozen":
             raise ApiError(409, "note_room_frozen")
         if status["mode"] != "registry" or status["generation"] != generation:
@@ -145,7 +180,7 @@ class NoteRegistryMixin:
                 raise ApiError(409, "note_prepare_changed")
             self.conn.execute("UPDATE note_rooms SET mode = 'legacy' WHERE room_id = ?", (room_id,))
 
-    def activate_note_room(self, room_id, generation, ops, owner_account_id, max_cache_bytes, folder_tree_id=None):
+    def activate_note_room(self, room_id, generation, ops, owner_account_id, max_cache_bytes, folder_tree_id=None, *, atomic_groups=False, shared_records=False, registry_media=False, media_seed=None):
         """Local operator entry. Ciphertexts are prepared for this exact generation."""
         with self._note_transaction(write=True):
             status = self.note_status(room_id)
@@ -159,14 +194,24 @@ class NoteRegistryMixin:
             revision = 0
             ids = set()
             seen_ops = set()
-            bootstrap_bytes = 0
+            if media_seed is not None and not registry_media:
+                raise ApiError(400, 'note_media_not_enabled')
+            media_ids, bootstrap_bytes = self._seed_note_media(room_id, generation, [] if media_seed is None else media_seed,
+                                                               max_cache_bytes - used)
+            unreferenced = set(media_ids)
+            if atomic_groups and folder_tree_id is None:
+                raise ApiError(400, "missing_folder_tree_seed")
             if folder_tree_id is not None and not _valid_id(folder_tree_id, NOTE_ID):
                 raise ApiError(400, "invalid_folder_tree_id")
             for raw in ops:
                 op, digest, length = validate_note_ops([raw])[0]
                 if (op["baseRevision"] != 0 or op["kind"] not in ("create", "delete")
-                        or op["noteId"] in ids or op["opId"] in seen_ops):
+                        or op.get("group") or op["noteId"] in ids or op["opId"] in seen_ops):
                     raise ApiError(400, "invalid_note_seed")
+                refs = set(op.get('mediaIds', []))
+                if refs and (op['noteId'] == folder_tree_id or not refs <= media_ids):
+                    raise ApiError(400, 'invalid_note_media_seed_refs')
+                unreferenced.difference_update(refs)
                 if op["noteId"] == folder_tree_id and op["kind"] != "create":
                     raise ApiError(400, "invalid_folder_tree_seed")
                 ids.add(op["noteId"])
@@ -179,29 +224,52 @@ class NoteRegistryMixin:
             if folder_tree_id is not None:
                 if folder_tree_id not in ids:
                     raise ApiError(400, "missing_folder_tree_seed")
-                self.conn.execute("INSERT INTO note_folder_trees VALUES (?, ?)", (room_id, folder_tree_id))
+                self.conn.execute("INSERT INTO note_folder_trees (room_id, note_id, atomic_groups) VALUES (?, ?, ?)",
+                                  (room_id, folder_tree_id, atomic_groups))
+            if unreferenced:
+                raise ApiError(400, 'invalid_note_media_seed_refs')
             # Initial state is obtained by scanning heads; it is not duplicated into an old feed.
-            self.conn.execute("""UPDATE note_rooms SET mode = 'registry', head = ?, floor = ?, bytes = ?
-                WHERE room_id = ?""", (revision, revision, bootstrap_bytes, room_id))
+            self.conn.execute("""UPDATE note_rooms SET mode = 'registry', head = ?, floor = ?, bytes = ?, shared_records = ?, registry_media = ?
+                WHERE room_id = ?""", (revision, revision, bootstrap_bytes, shared_records, registry_media, room_id))
             return self.note_status(room_id)
 
-    def _store_note_version(self, room_id, revision, sender_id, op, digest, length):
-        self.conn.execute("INSERT INTO note_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (room_id, revision, op["noteId"], op["opId"], op["kind"], op["baseRevision"],
-                           op["sealed"]["iv"], op["sealed"]["ciphertext"], length, time.time() + DEFAULT_TTL_SECONDS))
+    def _has_note_media(self, room_id, generation, ids):
+        placeholders = ','.join('?' for _ in ids)
+        return self.conn.execute(f"""SELECT COUNT(*) FROM note_media WHERE room_id = ? AND generation = ?
+            AND blob_id IN ({placeholders})""", (room_id, generation, *ids)).fetchone()[0] == len(ids)
+
+    def _store_note_version(self, room_id, revision, sender_id, op, digest, length, expires_at=None):
+        group = op.get("group", {})
+        self.conn.execute("""INSERT INTO note_versions (room_id, revision, note_id, op_id, kind, base_revision,
+            iv, ciphertext, bytes, expires_at, group_id, group_index, group_size, media_ids)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (room_id, revision, op["noteId"], op["opId"], op["kind"], op["baseRevision"], op["sealed"]["iv"],
+             op["sealed"]["ciphertext"], length, expires_at if expires_at is not None else time.time() + DEFAULT_TTL_SECONDS,
+             group.get("id"), group.get("index"), group.get("size"), json.dumps(op["mediaIds"]) if "mediaIds" in op else None))
         self.conn.execute("""INSERT INTO note_heads VALUES (?, ?, ?)
             ON CONFLICT (room_id, note_id) DO UPDATE SET revision = excluded.revision""", (room_id, op["noteId"], revision))
+        self._retain_note_media(room_id, op.get("mediaIds"))
         self.conn.execute("INSERT INTO note_receipts VALUES (?, ?, ?, ?, ?)",
                           (room_id, op["opId"], sender_id, digest, revision))
 
-    def commit_note_ops(self, room_id, generation, sender_id, owner_account_id, max_cache_bytes, ops, *, folder_tree=False):
+    def commit_note_ops(self, room_id, generation, sender_id, owner_account_id, max_cache_bytes, ops, *, folder_tree=False, groups=False, shared=False, media=False, observed_head=None):
+        if observed_head is not None and not _valid_int(observed_head):
+            raise ApiError(400, "invalid_note_revision")
         validated = validate_note_ops(ops)
+        group = validated[0][0].get("group")
+        if group and not groups:
+            raise ApiError(409, "note_upgrade_required")
         results, events = [], []
         with self._note_transaction(write=True):
-            status = self._require_note_registry(room_id, generation, folder_tree)
+            status = self._require_note_registry(room_id, generation, folder_tree, groups, shared, media)
+            if group and not status.get("atomicGroups"):
+                raise ApiError(409, "note_group_not_enabled")
             tree_id = self.conn.execute("SELECT note_id FROM note_folder_trees WHERE room_id = ?", (room_id,)).fetchone()
+            if group and (not tree_id or validated[-1][0]["noteId"] != tree_id["note_id"]):
+                raise ApiError(400, "invalid_note_group")
             head = status["head"]
             used = self.get_account_cache_bytes(owner_account_id)
+            staged = []
             written_bytes = 0
             for op, digest, length in validated:
                 op_id, note_id = op["opId"], op["noteId"]
@@ -217,10 +285,20 @@ class NoteRegistryMixin:
                         WHERE h.room_id = ? AND h.note_id = ?""", (room_id, note_id)).fetchone()
                     revision = current["revision"] if current else 0
                     kind = op["kind"]
-                    if tree_id and note_id == tree_id["note_id"] and kind != "update":
+                    # Compare against the transaction's original head, not earlier members of this batch.
+                    # ponytail: room-wide guard; use opaque per-folder membership only if contention warrants it.
+                    if status.get("atomicGroups") and observed_head != status["head"]:
+                        result = {"status": "rejected", "code": "note_head_required" if observed_head is None else "note_head_changed"}
+                    elif op.get("mediaIds") and not status.get("registryMedia"):
+                        result = {"status": "rejected", "code": "note_media_not_enabled"}
+                    elif tree_id and note_id == tree_id["note_id"] and op.get("mediaIds"):
+                        result = {"status": "rejected", "code": "invalid_note_media_refs"}
+                    elif tree_id and note_id == tree_id["note_id"] and kind != "update":
                         result = {"status": "rejected", "code": "invalid_folder_tree_transition"}
                     elif revision != op["baseRevision"]:
                         result = {"status": "stale", "current": self._note_version(room_id, revision) if current else None}
+                    elif op.get("mediaIds") and not self._has_note_media(room_id, generation, op["mediaIds"]):
+                        result = {"status": "rejected", "code": "note_media_not_found"}
                     elif ((kind == "create" and not current)
                           or (kind == "restore" and current and current["kind"] == "delete")
                           or (kind in ("update", "delete") and current and current["kind"] != "delete")):
@@ -230,12 +308,26 @@ class NoteRegistryMixin:
                         else:
                             head += 1
                             written_bytes += cost
-                            self._store_note_version(room_id, head, sender_id, op, digest, length)
-                            events.append({**op, "revision": head})
+                            if group:
+                                staged.append((head, op, digest, length))
+                            else:
+                                self._store_note_version(room_id, head, sender_id, op, digest, length)
+                                events.append({**op, "revision": head})
                             result = {"status": "accepted", "revision": head}
                     else:
                         result = {"status": "rejected", "code": "invalid_note_transition"}
                 results.append({"opId": op_id, **result})
+            if group:
+                complete = all(result["status"] == "accepted" for result in results)
+                if complete and len(staged) == len(validated):
+                    expires_at = time.time() + DEFAULT_TTL_SECONDS
+                    for revision, op, digest, length in staged:
+                        self._store_note_version(room_id, revision, sender_id, op, digest, length, expires_at)
+                        events.append({**op, "revision": revision})
+                elif not complete or staged:
+                    results = [result if result["status"] != "accepted" else {
+                        "opId": result["opId"], "status": "rejected", "code": "note_group_aborted"
+                    } for result in results]
             if events:
                 self.conn.execute("UPDATE note_rooms SET head = ?, bytes = bytes + ? WHERE room_id = ?",
                                   (head, written_bytes, room_id))
@@ -246,28 +338,36 @@ class NoteRegistryMixin:
                                 (room_id, revision)).fetchone()
         return _wire(row)
 
-    def _note_page(self, room_id, candidates, budget):
+    def _note_page(self, room_id, candidates, budget, *, whole_groups=False):
         page = []
         size = 0
         for row in candidates:
-            if len(page) == PAGE_COUNT or (page and size + row["bytes"] > budget):
+            if whole_groups and page and page[0].get("group", {}).get("size") == len(page):
+                return page, True
+            if whole_groups and row["group_id"] is not None:
+                if row["group_index"] == 0 and page:
+                    return page, True
+                # A group is already within the write cap. Do not split it to satisfy a read hint.
+            elif len(page) == PAGE_COUNT or (page and size + row["bytes"] > budget):
                 return page, True
             size += row["bytes"]
             page.append(self._note_version(room_id, row["revision"]))
         return page, False
 
-    def note_events(self, room_id, generation, since, budget, *, folder_tree=False):
+    def note_events(self, room_id, generation, since, budget, *, folder_tree=False, groups=False, shared=False, media=False):
         with self._note_transaction():
-            status = self._require_note_registry(room_id, generation, folder_tree)
-            candidates = self.conn.execute("""SELECT revision, bytes FROM note_versions
+            status = self._require_note_registry(room_id, generation, folder_tree, groups, shared, media)
+            candidates = self.conn.execute("""SELECT revision, bytes, group_id, group_index FROM note_versions
                 WHERE room_id = ? AND revision > ? ORDER BY revision LIMIT ?""",
                 (room_id, max(since, status["floor"]), PAGE_COUNT + 1)).fetchall()
-            events, _ = self._note_page(room_id, candidates, budget)
+            if candidates and candidates[0]["group_id"] is not None and candidates[0]["group_index"] != 0:
+                raise ApiError(409, "note_cursor_inside_group")
+            events, _ = self._note_page(room_id, candidates, budget, whole_groups=True)
             return {"generation": generation, "head": status["head"], "floor": status["floor"], "events": events}
 
-    def note_heads(self, room_id, generation, after, since, through, budget, *, folder_tree=False):
+    def note_heads(self, room_id, generation, after, since, through, budget, *, folder_tree=False, groups=False, shared=False, media=False):
         with self._note_transaction():
-            status = self._require_note_registry(room_id, generation, folder_tree)
+            status = self._require_note_registry(room_id, generation, folder_tree, groups, shared, media)
             candidates = self.conn.execute("""SELECT v.revision, v.bytes FROM note_heads h
                 JOIN note_versions v ON v.room_id = h.room_id AND v.revision = h.revision
                 WHERE h.room_id = ? AND h.note_id > ? AND h.revision > ? AND h.revision <= ?

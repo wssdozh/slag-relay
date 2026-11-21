@@ -90,6 +90,7 @@ class StoreBase:
         with self.conn:
             self.conn.execute("DELETE FROM bundles WHERE expires_at <= ?", (now,))
             self.cleanup_note_versions(now)
+            self.cleanup_note_media(now)
             self.conn.execute("DELETE FROM bundle_acks WHERE bundle_id NOT IN (SELECT bundle_id FROM bundles)")
             self.conn.execute("DELETE FROM pairing_sessions WHERE expires_at <= ?", (now,))
             self.conn.execute("DELETE FROM auth_challenges WHERE expires_at <= ?", (now,))

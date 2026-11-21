@@ -43,7 +43,10 @@ class Realtime:
 
             note_generation = query_revision(query, "noteGeneration")
             folder_tree = query.get("folderTree") == "1"
-            self.db.check_legacy_note_generation(room_id, note_generation, folder_tree=folder_tree)
+            groups = query.get("atomicGroups") == "1"
+            shared = query.get("sharedRecords") == "1"
+            media = query.get("registryMedia") == "1"
+            self.db.check_legacy_note_generation(room_id, note_generation, folder_tree=folder_tree, groups=groups, shared=shared, media=media)
             ws_key = headers.get("sec-websocket-key", "")
             if not ws_key:
                 raise ApiError(400, "missing_sec_websocket_key")
@@ -56,6 +59,9 @@ class Realtime:
             conn.vault_id = vault_id
             conn.note_generation = note_generation
             conn.folder_tree = folder_tree
+            conn.atomic_groups = groups
+            conn.shared_records = shared
+            conn.registry_media = media
             self.rooms.setdefault(room_id, set()).add(conn)
             self.db.touch_room(room_id, vault_id)
             logger.info("WebSocket connected")
@@ -121,7 +127,8 @@ class Realtime:
 
     def _check_ws_auth(self, conn: WebSocketConnection, write: bool = False) -> None:
         self.db.check_legacy_note_generation(conn.room_id, getattr(conn, 'note_generation', None), write=write,
-                                             folder_tree=getattr(conn, 'folder_tree', False))
+                                             folder_tree=getattr(conn, 'folder_tree', False), groups=getattr(conn, 'atomic_groups', False),
+                                             shared=getattr(conn, 'shared_records', False), media=getattr(conn, 'registry_media', False))
         if conn.token_hash:
             auth = self.db.authenticate_hash(conn.token_hash)
             if not auth:
@@ -183,7 +190,8 @@ class Realtime:
                 raise ApiError(409, "note_upgrade_required")
             result = await receive_note_ops(self, msg, conn.room_id, conn.device_id, conn.account_id,
                                             conn.max_cache_bytes, conn.note_generation,
-                                            folder_tree=getattr(conn, 'folder_tree', False))
+                                            folder_tree=getattr(conn, 'folder_tree', False), groups=getattr(conn, 'atomic_groups', False),
+                                             shared=getattr(conn, 'shared_records', False), media=getattr(conn, 'registry_media', False))
             await conn.send_text(json.dumps(result, separators=(",", ":")))
             return
         if msg_type == "bundle":
@@ -217,7 +225,8 @@ class Realtime:
         saved = self.db.save_bundle(conn.room_id, bundle_id, from_device, seq, timestamp, payload_str,
                                     max_cache_bytes=conn.max_cache_bytes, account_id=conn.account_id, vault_id=vault_id,
                                      note_generation=getattr(conn, 'note_generation', None),
-                                    folder_tree=getattr(conn, 'folder_tree', False))
+                                    folder_tree=getattr(conn, 'folder_tree', False), groups=getattr(conn, 'atomic_groups', False),
+                                             shared=getattr(conn, 'shared_records', False), media=getattr(conn, 'registry_media', False))
         if not saved:
             await conn.send_text(json.dumps({"type": "error", "code": "cache_limit_exceeded"}))
             return
