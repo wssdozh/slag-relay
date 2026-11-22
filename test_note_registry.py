@@ -4,6 +4,8 @@ import hashlib
 import json
 import time
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from errors import ApiError
 import test_relay
@@ -38,6 +40,58 @@ class TestNoteRegistry(test_relay.RelayTestCase):
         self.account_id = identity['accountId']
         self.generation = self.db.freeze_note_room(ROOM)
         return token, guest
+
+    async def test_admin_cutover_guards_backup_and_atomic_publish(self):
+        token, guest = await self.setup_room()
+        admin = self.server.admin_token = 'test-note-cutover'
+        url = f'/api/admin/rooms/{ROOM}/note-'
+        await self.http('POST', url + 'thaw', {'generation': self.generation}, admin)
+        self.assertEqual((await self.http('POST', url + 'freeze', {}, token))[0], 401)
+        code, frozen = await self.http('POST', url + 'freeze', {}, admin)
+        self.assertEqual(code, 200)
+        generation = frozen['noteStatus']['generation']
+        writers = [x['id'] for x in frozen['writers']]
+        self.assertEqual(writers, ['device-1', 'device-2'])
+        blob = b'ciphertext-only-fixture' * 2
+        blob_id = hashlib.sha256(blob).hexdigest()
+        tree = 'b' * 64
+        seed = {'room': ROOM, 'generation': generation, 'writers': writers, 'folderTreeId': tree,
+                'atomicGroups': True, 'registryMedia': True,
+                'media': [{'id': blob_id, 'ciphertext': base64.b64encode(blob).decode()}],
+                'ops': [{**operation('create'), 'mediaIds': [blob_id]}, operation('delete', 'delete', note_id='c' * 64),
+                        operation('tree', note_id=tree)]}
+        request = {'generation': generation, 'confirmRoom': ROOM, 'seed': seed}
+        self.assertEqual((await self.http('POST', url + 'activate', {**request, 'confirmRoom': 'other'}, admin))[0], 400)
+        self.assertEqual((await self.http('POST', url + 'activate', {**request, 'generation': generation - 1}, admin))[0], 409)
+        self.assertEqual((await self.http('PUT', f'/api/vaults/{VAULT}/grants/device-2',
+                                         {'mode': 'receive-only', 'encryptedKey': 'key'}, token))[0], 200)
+        await self.http('POST', f'/api/vaults/{VAULT}/accept', {}, guest)
+        self.assertEqual((await self.http('POST', url + 'activate', request, admin))[0], 409)
+        self.assertEqual((await self.http('POST', url + 'thaw', {'generation': generation}, admin))[0], 200)
+        code, frozen = await self.http('POST', url + 'freeze', {}, admin)
+        self.assertEqual(code, 200)
+        self.assertEqual((await self.http('POST', url + 'activate', request, admin))[0], 409)
+        generation = frozen['noteStatus']['generation']
+        seed.update(generation=generation, writers=['device-1'])
+        request['generation'] = generation
+        with patch('note_registry_admin._backup_note_cutover', side_effect=OSError('disk full')):
+            self.assertEqual((await self.http('POST', url + 'activate', request, admin))[0], 503)
+        self.assertEqual(self.db.note_status(ROOM)['mode'], 'frozen')
+        malformed = {**seed, 'ops': [*seed['ops'], {**operation('leak', note_id='d' * 64), 'content': 'not ciphertext'}]}
+        self.assertEqual((await self.http('POST', url + 'activate', {**request, 'seed': malformed}, admin))[0], 400)
+        self.db.touch_room('neighbor', VAULT)
+        self.assertEqual((await self.http('POST', url + 'activate', request, admin))[0], 200)
+        self.assertEqual((await self.http('POST', url + 'activate', request, admin))[0], 409)
+        self.assertEqual(self.db.note_status('neighbor')['mode'], 'legacy')
+        backups = list((Path(self.db.db_path).parent / 'backups').glob('note-cutover-*.sqlite'))
+        self.assertEqual(len(backups), 1)
+        for client in (token, guest):
+            query = f'vault={VAULT}&generation={generation}&folderTree=1&atomicGroups=1&registryMedia=1'
+            code, heads = await self.http('GET', f'/api/rooms/{ROOM}/note-heads?{query}&through=3', token=client)
+            self.assertEqual(code, 200)
+            self.assertEqual({head['kind'] for head in heads['heads']}, {'create', 'delete'})
+            self.assertEqual((await self.http('GET', f'/api/rooms/{ROOM}/note-media?{query}&id={blob_id}', token=client))[1],
+                             {'ciphertext': seed['media'][0]['ciphertext']})
 
     def commit(self, *ops, sender=OWNER, quota=QUOTA, media=False):
         return self.db.commit_note_ops(ROOM, self.generation, sender, self.account_id, quota, list(ops), media=media)

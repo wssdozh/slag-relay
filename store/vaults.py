@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import secrets
 from errors import ApiError
@@ -112,3 +114,17 @@ class VaultsMixin:
         if accept:
             return {"id": vault_id, "name": row["name"], "mode": row["mode"], "encryptedKey": row["encrypted_key"]}
         return {"status": "ok"}
+
+    def note_room_writers(self, room_id):
+        rows = self.conn.execute("""SELECT g.device_id, g.updated_at, d.name
+            FROM vault_grants g JOIN rooms r ON g.vault_id = r.vault_id
+            JOIN devices d ON d.id = g.device_id JOIN vaults v ON v.id = r.vault_id
+            WHERE r.room_id = ? AND NOT r.retired AND g.status = 'accepted' AND g.mode = 'read-write'
+              AND d.status = 'active' AND d.account_id = v.owner_account_id ORDER BY g.device_id""", (room_id,)).fetchall()
+        digest = hashlib.sha256(json.dumps([(row["device_id"], row["updated_at"]) for row in rows]).encode()).hexdigest()
+        return digest, [{"id": row["device_id"], "name": row["name"]} for row in rows]
+
+    def require_note_prepare_writers(self, room_id):
+        row = self.conn.execute('SELECT prepare_writers FROM note_rooms WHERE room_id = ?', (room_id,)).fetchone()
+        if not row or not row[0] or row[0] != self.note_room_writers(room_id)[0]:
+            raise ApiError(409, 'note_prepare_writers_changed')

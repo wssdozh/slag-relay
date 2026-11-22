@@ -21,6 +21,7 @@ from errors import ApiError
 from fmt import hash_token, iso_time
 from ai_proxy import AiProxy
 from router import _NEXT
+from note_registry_admin import admin_note_migration
 
 
 class AdminOpsRoutes:
@@ -128,7 +129,7 @@ class AdminOpsRoutes:
         if method == "GET" and path == "/api/admin/rooms":
             self._admin_auth(headers)
             room_rows = self.db.conn.execute("""
-                SELECT r.room_id, r.vault_id, r.last_active_at, r.created_at,
+                SELECT r.room_id, r.vault_id, r.retired, r.last_active_at, r.created_at,
                        COUNT(b.bundle_id) AS bundles_count,
                        COALESCE(SUM(LENGTH(b.payload)), 0) AS cache_bytes
                 FROM rooms r
@@ -137,14 +138,20 @@ class AdminOpsRoutes:
                 ORDER BY r.last_active_at DESC
                 LIMIT 100
             """).fetchall()
-            rooms_list = [{
-                "roomId": r["room_id"],
-                "vaultId": r["vault_id"],
-                "lastActiveAt": iso_time(r["last_active_at"]),
-                "createdAt": iso_time(r["created_at"]),
-                "bundlesCount": r["bundles_count"],
-                "cacheBytes": r["cache_bytes"],
-            } for r in room_rows]
+            rooms_list = []
+            for r in room_rows:
+                note_status = self.db.note_status(r["room_id"])
+                rooms_list.append({
+                    "roomId": r["room_id"],
+                    "vaultId": r["vault_id"],
+                    "lastActiveAt": iso_time(r["last_active_at"]),
+                    "createdAt": iso_time(r["created_at"]),
+                    "bundlesCount": r["bundles_count"],
+                    "cacheBytes": r["cache_bytes"],
+                    "noteStatus": note_status,
+                    "noteMigration": bool(r["vault_id"] and not r["retired"]),
+                    "noteWriters": self.db.note_room_writers(r["room_id"])[1] if note_status["mode"] == "frozen" else [],
+                })
             return {"status": "ok", "rooms": rooms_list}, 200
 
         if method == "POST" and path == "/api/admin/maintenance/cleanup":
@@ -169,6 +176,10 @@ class AdminOpsRoutes:
 
         if path.startswith("/api/admin/rooms/") and method == "POST":
             parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[4] in ("note-freeze", "note-thaw", "note-activate"):
+                self._admin_auth(headers)
+                room_id = urllib.parse.unquote(parts[3])
+                return await admin_note_migration(self, room_id, parts[4], body), 200
             if len(parts) == 5 and parts[4] in ("purge", "purge-unacked"):
                 self._admin_auth(headers)
                 room_id = urllib.parse.unquote(parts[3])

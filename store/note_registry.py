@@ -158,15 +158,18 @@ class NoteRegistryMixin(NoteMediaMixin):
             raise ApiError(409, "note_upgrade_required")
         return status
 
-    def freeze_note_room(self, room_id):
-        """Local operator entry. An already active room must not revert to legacy."""
+    def freeze_note_room(self, room_id, *, track_writers=False):
+        """Operator entry. An already active room must not revert to legacy."""
         with self._note_transaction(write=True):
             room = self.conn.execute("SELECT vault_id, retired FROM rooms WHERE room_id = ?", (room_id,)).fetchone()
             if not room or not room["vault_id"] or room["retired"]:
                 raise ApiError(409, "note_room_not_bound")
-            self.conn.execute("""INSERT INTO note_rooms (room_id, mode, generation) VALUES (?, 'frozen', 1)
-                ON CONFLICT (room_id) DO UPDATE SET mode = 'frozen', generation = note_rooms.generation + 1
-                WHERE note_rooms.mode = 'legacy'""", (room_id,))
+            writers, devices = self.note_room_writers(room_id) if track_writers else (None, [])
+            if track_writers and not devices:
+                raise ApiError(409, "note_no_writers")
+            self.conn.execute("""INSERT INTO note_rooms (room_id, mode, generation, prepare_writers) VALUES (?, 'frozen', 1, ?)
+                ON CONFLICT (room_id) DO UPDATE SET mode = 'frozen', generation = note_rooms.generation + 1,
+                    prepare_writers = excluded.prepare_writers WHERE note_rooms.mode = 'legacy'""", (room_id, writers))
             status = self.note_status(room_id)
             if status["mode"] != "frozen":
                 raise ApiError(409, "note_registry_active")
@@ -178,10 +181,10 @@ class NoteRegistryMixin(NoteMediaMixin):
             status = self.note_status(room_id)
             if status["mode"] != "frozen" or status["generation"] != generation:
                 raise ApiError(409, "note_prepare_changed")
-            self.conn.execute("UPDATE note_rooms SET mode = 'legacy' WHERE room_id = ?", (room_id,))
+            self.conn.execute("UPDATE note_rooms SET mode = 'legacy', prepare_writers = NULL WHERE room_id = ?", (room_id,))
 
-    def activate_note_room(self, room_id, generation, ops, owner_account_id, max_cache_bytes, folder_tree_id=None, *, atomic_groups=False, shared_records=False, registry_media=False, media_seed=None):
-        """Local operator entry. Ciphertexts are prepared for this exact generation."""
+    def activate_note_room(self, room_id, generation, ops, owner_account_id, max_cache_bytes, folder_tree_id=None, *, atomic_groups=False, shared_records=False, registry_media=False, media_seed=None, check_writers=False):
+        """Operator entry. Ciphertexts are prepared for this exact generation."""
         with self._note_transaction(write=True):
             status = self.note_status(room_id)
             if status["mode"] != "frozen" or status["generation"] != generation:
@@ -190,6 +193,8 @@ class NoteRegistryMixin(NoteMediaMixin):
                 JOIN vaults v ON v.id = r.vault_id WHERE r.room_id = ? AND NOT r.retired""", (room_id,)).fetchone()
             if not owner or owner["owner_account_id"] != owner_account_id:
                 raise ApiError(403, "note_room_owner_mismatch")
+            if check_writers:
+                self.require_note_prepare_writers(room_id)
             used = self.get_account_cache_bytes(owner_account_id)
             revision = 0
             ids = set()
@@ -229,7 +234,7 @@ class NoteRegistryMixin(NoteMediaMixin):
             if unreferenced:
                 raise ApiError(400, 'invalid_note_media_seed_refs')
             # Initial state is obtained by scanning heads; it is not duplicated into an old feed.
-            self.conn.execute("""UPDATE note_rooms SET mode = 'registry', head = ?, floor = ?, bytes = ?, shared_records = ?, registry_media = ?
+            self.conn.execute("""UPDATE note_rooms SET mode = 'registry', prepare_writers = NULL, head = ?, floor = ?, bytes = ?, shared_records = ?, registry_media = ?
                 WHERE room_id = ?""", (revision, revision, bootstrap_bytes, shared_records, registry_media, room_id))
             return self.note_status(room_id)
 

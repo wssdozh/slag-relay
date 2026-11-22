@@ -341,3 +341,4 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         ensure_column(conn, "note_folder_trees", "atomic_groups", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "note_rooms", "shared_records", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "note_rooms", "registry_media", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "note_rooms", "prepare_writers", "TEXT")
